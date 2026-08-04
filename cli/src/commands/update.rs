@@ -8,7 +8,7 @@ use expensify::{
 
 use crate::cli::{
     GlobalArgs, PrimaryPolicyArg, TagApproversArgs, UpdateCommand, UpdateEmployeesArgs,
-    UpdateExpenseRuleArgs, UpdateMode, UpdatePolicyArgs,
+    UpdateExpenseRuleArgs, UpdateMode, UpdatePolicyArgs, usage_error,
 };
 use crate::commands::client;
 use crate::output::View;
@@ -29,7 +29,7 @@ pub async fn run(command: UpdateCommand, global: &GlobalArgs) -> Result<()> {
 
 async fn policy(args: UpdatePolicyArgs, global: &GlobalArgs) -> Result<()> {
     if args.categories.is_none() && args.report_fields.is_none() && !has_tags(&args) {
-        bail!("nothing to update: give --categories, --report-fields, --tags or --tags-csv");
+        usage_error("nothing to update: give --categories, --report-fields, --tags or --tags-csv");
     }
 
     let client = client(global)?;
@@ -60,7 +60,7 @@ async fn policy(args: UpdatePolicyArgs, global: &GlobalArgs) -> Result<()> {
         ));
     } else if let Some(path) = &args.tags_csv {
         let data = read_input_bytes(path)?;
-        action = action.tags(TagsUpdate::replace_all_csv(data, tag_csv_config(&args)?));
+        action = action.tags(TagsUpdate::replace_all_csv(data, tag_csv_config(&args)));
     }
 
     action
@@ -81,15 +81,15 @@ fn has_tags(args: &UpdatePolicyArgs) -> bool {
 /// Expensify's `setRequired` is one flag for dependent levels and one per
 /// level otherwise; the library makes the wrong pairing unrepresentable, so
 /// this only has to route the flags.
-fn tag_csv_config(args: &UpdatePolicyArgs) -> Result<TagCsvConfig> {
+fn tag_csv_config(args: &UpdatePolicyArgs) -> TagCsvConfig {
     let mut config = if args.tags_csv_dependent {
         match args.tags_csv_required.as_slice() {
             [] => TagCsvConfig::dependent(false),
             [required] => TagCsvConfig::dependent(*required),
-            more => bail!(
+            more => usage_error(format!(
                 "dependent tag levels take one --tags-csv-required value, got {}",
                 more.len()
-            ),
+            )),
         }
     } else {
         TagCsvConfig::independent(args.tags_csv_required.iter().copied())
@@ -103,19 +103,21 @@ fn tag_csv_config(args: &UpdatePolicyArgs) -> Result<TagCsvConfig> {
     if args.tags_csv_tsv {
         config = config.tsv();
     }
-    Ok(config)
+    config
 }
 
 async fn tag_approvers(args: TagApproversArgs, global: &GlobalArgs) -> Result<()> {
     if args.assign.is_empty() && args.clear.is_empty() {
-        bail!("give at least one --assign TAG=EMAIL or --clear TAG");
+        usage_error("give at least one --assign TAG=EMAIL or --clear TAG");
     }
 
     let mut approvers = Vec::with_capacity(args.assign.len() + args.clear.len());
     for raw in &args.assign {
-        let (tag, email) = parse_pair(raw, "--assign")?;
+        let (tag, email) = parse_pair(raw, "--assign").unwrap_or_else(|err| usage_error(err));
         if email.is_empty() {
-            bail!("--assign {raw} has no email; use --clear {tag} to remove an approver");
+            usage_error(format!(
+                "--assign {raw} has no email; use --clear {tag} to remove an approver"
+            ));
         }
         approvers.push(TagApprover::assign(tag, email));
     }
@@ -137,7 +139,7 @@ async fn tag_approvers(args: TagApproversArgs, global: &GlobalArgs) -> Result<()
 
 async fn expense_rule(args: UpdateExpenseRuleArgs, global: &GlobalArgs) -> Result<()> {
     if args.tag.is_none() && args.default_billable.is_none() {
-        bail!("an expense rule needs --tag or --default-billable");
+        usage_error("an expense rule needs --tag or --default-billable");
     }
 
     let client = client(global)?;

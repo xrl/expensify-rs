@@ -121,6 +121,28 @@ fn reimbursement_windows_need_a_start() {
     assert!(stderr(&output).contains("--since"), "{output:?}");
 }
 
+/// "At least one of these flags" is not an `ArgGroup` clap can enforce here,
+/// but it is still a usage error, and it must exit like one.
+#[test]
+fn hand_checked_constraints_exit_as_usage_errors() {
+    for args in [
+        vec!["update", "policy", "P1"],
+        vec!["update", "tag-approvers", "--policy-id", "P1"],
+        vec!["create", "expenses"],
+        vec![
+            "create",
+            "expense-rule",
+            "--policy-id",
+            "P1",
+            "--employee-email",
+            "a@acme.com",
+        ],
+    ] {
+        let output = expensify(&args);
+        assert_eq!(code(&output), 2, "{args:?}: {}", stderr(&output));
+    }
+}
+
 #[test]
 fn a_bad_date_names_the_expected_format() {
     let output = expensify(&["reimburse", "--since", "07/01/2026"]);

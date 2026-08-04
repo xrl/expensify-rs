@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::cli::{
     CreateCommand, CreateExpenseRuleArgs, CreateExpensesArgs, CreatePolicyArgs, CreateReportArgs,
-    GlobalArgs, PolicyPlanArg,
+    GlobalArgs, PolicyPlanArg, usage_error,
 };
 use crate::commands::client;
 use crate::output::View;
@@ -56,7 +56,7 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?
         }
         (None, Some(_)) => vec![inline_expense(&args)?],
-        (None, None) => bail!("give --file, or --merchant with --date and --amount-cents"),
+        (None, None) => usage_error("give --file, or --merchant with --date and --amount-cents"),
     };
 
     let client = client(global)?;
@@ -159,7 +159,7 @@ async fn report(args: CreateReportArgs, global: &GlobalArgs) -> Result<()> {
         lines,
     );
     for raw in &args.fields {
-        let (name, value) = parse_pair(raw, "--field")?;
+        let (name, value) = parse_pair(raw, "--field").unwrap_or_else(|err| usage_error(err));
         action = action.report_field(name, value);
     }
 
@@ -176,7 +176,7 @@ async fn report(args: CreateReportArgs, global: &GlobalArgs) -> Result<()> {
 
 async fn expense_rule(args: CreateExpenseRuleArgs, global: &GlobalArgs) -> Result<()> {
     if args.tag.is_none() && args.default_billable.is_none() {
-        bail!("an expense rule needs --tag or --default-billable");
+        usage_error("an expense rule needs --tag or --default-billable");
     }
 
     let client = client(global)?;
