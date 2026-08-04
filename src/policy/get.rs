@@ -14,17 +14,21 @@ use std::marker::PhantomData;
 
 use serde::de::DeserializeOwned;
 
+use crate::BoxFuture;
 use crate::client::Client;
-use crate::error::Error;
+use crate::error::{DecodeError, Error};
 use crate::policy::model::{Category, PolicyEmployee, PolicyTag, ReportField, TaxConfig};
 use crate::types::PolicyId;
-use crate::BoxFuture;
+use crate::wire;
 
 mod sealed {
     pub trait Sealed {}
 }
 
 /// Everything a fetch-gated payload must satisfy.
+///
+/// Blanket-implemented; the bound exists so [`Policy`] can derive `Debug`
+/// and `Clone` without a where-clause per field.
 pub trait Payload: fmt::Debug + Clone + Send + Sync + 'static {}
 
 impl<T: fmt::Debug + Clone + Send + Sync + 'static> Payload for T {}
@@ -32,10 +36,16 @@ impl<T: fmt::Debug + Clone + Send + Sync + 'static> Payload for T {}
 /// Type-level flag: was this policy field requested? Sealed; the only
 /// states are [`Fetched`] and [`Omitted`].
 pub trait FetchState: sealed::Sealed + Send + Sync + 'static {
+    /// `T` when fetched, [`NotFetched`] when omitted.
     type Wrap<T: Payload>: Payload;
 
+    /// Deserialization hook, so one generic `IntoFuture` impl serves all 32
+    /// combinations of states.
     #[doc(hidden)]
-    fn extract<T>(field: &'static str, value: Option<serde_json::Value>) -> Result<Self::Wrap<T>, Error>
+    fn extract<T>(
+        field: &'static str,
+        value: Option<serde_json::Value>,
+    ) -> Result<Self::Wrap<T>, Error>
     where
         T: DeserializeOwned + Payload;
 }
@@ -63,14 +73,22 @@ impl FetchState for Fetched {
     where
         T: DeserializeOwned + Payload,
     {
-        todo!()
+        let value = value.ok_or_else(|| {
+            Error::from(DecodeError::custom(format!(
+                "policy response is missing requested field `{field}`"
+            )))
+        })?;
+        serde_json::from_value(value).map_err(|err| DecodeError::Json(err).into())
     }
 }
 
 impl FetchState for Omitted {
     type Wrap<T: Payload> = NotFetched;
 
-    fn extract<T>(_field: &'static str, _value: Option<serde_json::Value>) -> Result<NotFetched, Error>
+    fn extract<T>(
+        _field: &'static str,
+        _value: Option<serde_json::Value>,
+    ) -> Result<NotFetched, Error>
     where
         T: DeserializeOwned + Payload,
     {
@@ -88,12 +106,16 @@ pub struct Policy<
     Tax: FetchState = Omitted,
     Emps: FetchState = Omitted,
 > {
+    /// Expense categories, present when `with_categories()` was called.
     pub categories: Cats::Wrap<Vec<Category>>,
+    /// Report fields, present when `with_report_fields()` was called.
     pub report_fields: Fields::Wrap<Vec<ReportField>>,
+    /// Tags, present when `with_tags()` was called.
     pub tags: Tags::Wrap<Vec<PolicyTag>>,
     /// `None` when the policy has no tax configuration (the API returns
     /// `"tax": {}`); this `Option` is data-dependent, not request-dependent.
     pub tax: Tax::Wrap<Option<TaxConfig>>,
+    /// Policy members, present when `with_employees()` was called.
     pub employees: Emps::Wrap<Vec<PolicyEmployee>>,
 }
 
@@ -114,7 +136,11 @@ pub struct GetPoliciesBuilder {
 
 impl GetPoliciesBuilder {
     pub(crate) fn new(client: Client, ids: Vec<PolicyId>) -> Self {
-        Self { client, ids, user_email: None }
+        Self {
+            client,
+            ids,
+            user_email: None,
+        }
     }
 
     /// Act on behalf of another user (`userEmail`). Requires a prior
@@ -134,22 +160,29 @@ impl GetPoliciesBuilder {
         }
     }
 
+    /// Request expense categories.
     pub fn with_categories(self) -> GetPoliciesAction<Fetched, Omitted, Omitted, Omitted, Omitted> {
         self.action().with_categories()
     }
 
-    pub fn with_report_fields(self) -> GetPoliciesAction<Omitted, Fetched, Omitted, Omitted, Omitted> {
+    /// Request report fields.
+    pub fn with_report_fields(
+        self,
+    ) -> GetPoliciesAction<Omitted, Fetched, Omitted, Omitted, Omitted> {
         self.action().with_report_fields()
     }
 
+    /// Request tags.
     pub fn with_tags(self) -> GetPoliciesAction<Omitted, Omitted, Fetched, Omitted, Omitted> {
         self.action().with_tags()
     }
 
+    /// Request the tax configuration.
     pub fn with_tax(self) -> GetPoliciesAction<Omitted, Omitted, Omitted, Fetched, Omitted> {
         self.action().with_tax()
     }
 
+    /// Request policy members.
     pub fn with_employees(self) -> GetPoliciesAction<Omitted, Omitted, Omitted, Omitted, Fetched> {
         self.action().with_employees()
     }
@@ -172,6 +205,8 @@ pub struct GetPoliciesAction<
     /// parameters shape only the response.
     fields: Vec<&'static str>,
     user_email: Option<String>,
+    // `fn() -> _` keeps the action `Send + Sync` regardless of the states.
+    #[allow(clippy::type_complexity)]
     _marker: PhantomData<fn() -> (Cats, Fields, Tags, Tax, Emps)>,
 }
 
@@ -189,7 +224,10 @@ where
         self
     }
 
-    fn cast<C2, F2, T2, X2, E2>(mut self, field: &'static str) -> GetPoliciesAction<C2, F2, T2, X2, E2>
+    fn cast<C2, F2, T2, X2, E2>(
+        mut self,
+        field: &'static str,
+    ) -> GetPoliciesAction<C2, F2, T2, X2, E2>
     where
         C2: FetchState,
         F2: FetchState,
@@ -215,6 +253,7 @@ where
     Tax: FetchState,
     Emps: FetchState,
 {
+    /// Request expense categories.
     pub fn with_categories(self) -> GetPoliciesAction<Fetched, Fields, Tags, Tax, Emps> {
         self.cast("categories")
     }
@@ -227,6 +266,7 @@ where
     Tax: FetchState,
     Emps: FetchState,
 {
+    /// Request report fields.
     pub fn with_report_fields(self) -> GetPoliciesAction<Cats, Fetched, Tags, Tax, Emps> {
         self.cast("reportFields")
     }
@@ -239,6 +279,7 @@ where
     Tax: FetchState,
     Emps: FetchState,
 {
+    /// Request tags.
     pub fn with_tags(self) -> GetPoliciesAction<Cats, Fields, Fetched, Tax, Emps> {
         self.cast("tags")
     }
@@ -251,6 +292,7 @@ where
     Tags: FetchState,
     Emps: FetchState,
 {
+    /// Request the tax configuration.
     pub fn with_tax(self) -> GetPoliciesAction<Cats, Fields, Tags, Fetched, Emps> {
         self.cast("tax")
     }
@@ -263,6 +305,7 @@ where
     Tags: FetchState,
     Tax: FetchState,
 {
+    /// Request policy members.
     pub fn with_employees(self) -> GetPoliciesAction<Cats, Fields, Tags, Tax, Fetched> {
         self.cast("employees")
     }
@@ -281,8 +324,30 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let request = wire::get_policies(&self.ids, &self.fields, self.user_email.as_deref());
+            let response = self.client.send(request).await?;
+
+            let mut policies = Policies::new();
+            for (id, mut info) in wire::policy_info(response)? {
+                let mut section = |key: &str| info.as_object_mut().and_then(|map| map.remove(key));
+                let categories = section("categories");
+                let report_fields = section("reportFields");
+                let tags = section("tags");
+                let tax = section("tax").map(wire::normalize_tax);
+                let employees = section("employees");
+
+                policies.insert(
+                    id,
+                    Policy {
+                        categories: Cats::extract("categories", categories)?,
+                        report_fields: Fields::extract("reportFields", report_fields)?,
+                        tags: Tags::extract("tags", tags)?,
+                        tax: Tax::extract("tax", tax)?,
+                        employees: Emps::extract("employees", employees)?,
+                    },
+                );
+            }
+            Ok(policies)
         })
     }
 }

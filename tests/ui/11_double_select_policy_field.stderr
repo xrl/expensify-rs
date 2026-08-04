@@ -1,0 +1,13 @@
+error[E0599]: no method named `with_tax` found for struct `GetPoliciesAction<Omitted, Omitted, Omitted, Fetched>` in the current scope
+ --> tests/ui/11_double_select_policy_field.rs:9:52
+  |
+9 |     let _ = client.get_policies(["P1"]).with_tax().with_tax();
+  |                    --------------------            ^^^^^^^^
+  |                    |
+  |                    method `with_tax` is available on `GetPoliciesBuilder`
+  |
+help: there is a method `with_tags` with a similar name
+  |
+9 -     let _ = client.get_policies(["P1"]).with_tax().with_tax();
+9 +     let _ = client.get_policies(["P1"]).with_tax().with_tags();
+  |

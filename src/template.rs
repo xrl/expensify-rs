@@ -12,10 +12,31 @@ use crate::error::DecodeError;
 /// carried as a phantom parameter from template to exported file to
 /// download, so `Self::Output` can differ from `Self` (see [`Json`]).
 ///
-/// Open for user implementation (e.g. a CSV marker in the caller's crate).
+/// Open for user implementation (e.g. a CSV marker in the caller's crate):
+///
+/// ```
+/// use bytes::Bytes;
+/// use expensify::{DecodeError, FromExport};
+///
+/// struct SemicolonCsv;
+///
+/// impl FromExport for SemicolonCsv {
+///     type Output = Vec<Vec<String>>;
+///
+///     fn from_export(bytes: Bytes) -> Result<Self::Output, DecodeError> {
+///         let text = String::from_utf8(bytes.to_vec())?;
+///         Ok(text
+///             .lines()
+///             .map(|line| line.split(';').map(str::to_owned).collect())
+///             .collect())
+///     }
+/// }
+/// ```
 pub trait FromExport {
+    /// What a download of this template's output resolves to.
     type Output: Send + 'static;
 
+    /// Decode one downloaded export body.
     fn from_export(bytes: Bytes) -> Result<Self::Output, DecodeError>;
 }
 
@@ -39,6 +60,11 @@ impl FromExport for String {
 
 /// Marker for templates whose output is JSON deserializable into `T`.
 /// Never instantiated; exists only at the type level.
+///
+/// The default [`ExportFormat`](crate::ExportFormat) is still
+/// [`Csv`](crate::ExportFormat::Csv), so a `Json<_>` template must also call
+/// `.format(ExportFormat::Json)` — the mismatch shows up as a decode error
+/// on download rather than as silently corrupt data.
 pub struct Json<T>(PhantomData<fn() -> T>);
 
 impl<T: DeserializeOwned + Send + 'static> FromExport for Json<T> {
@@ -73,6 +99,7 @@ macro_rules! template_type {
         }
 
         impl<F> $name<F> {
+            /// The FreeMarker source as given.
             pub fn source(&self) -> &str {
                 &self.source
             }

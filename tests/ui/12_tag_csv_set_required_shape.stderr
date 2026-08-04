@@ -1,0 +1,29 @@
+error[E0308]: mismatched types
+ --> tests/ui/12_tag_csv_set_required_shape.rs:9:37
+  |
+9 |     let _ = TagCsvConfig::dependent([true, false]);
+  |             ----------------------- ^^^^^^^^^^^^^ expected `bool`, found `[bool; 2]`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/policy/update.rs
+  |
+  |     pub fn dependent(set_required: bool) -> Self {
+  |            ^^^^^^^^^
+
+error[E0277]: `bool` is not an iterator
+  --> tests/ui/12_tag_csv_set_required_shape.rs:12:39
+   |
+12 |     let _ = TagCsvConfig::independent(true);
+   |             ------------------------- ^^^^ `bool` is not an iterator
+   |             |
+   |             required by a bound introduced by this call
+   |
+   = help: the trait `Iterator` is not implemented for `bool`
+   = note: required for `bool` to implement `IntoIterator`
+note: required by a bound in `TagCsvConfig::independent`
+  --> src/policy/update.rs
+   |
+   |     pub fn independent<I: IntoIterator<Item = bool>>(set_required: I) -> Self {
+   |                           ^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `TagCsvConfig::independent`

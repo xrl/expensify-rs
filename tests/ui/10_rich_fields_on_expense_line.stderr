@@ -1,0 +1,13 @@
+error[E0599]: no method named `category` found for struct `ExpenseLine` in the current scope
+  --> tests/ui/10_rich_fields_on_expense_line.rs:14:6
+   |
+ 9 |       let _ = ExpenseLine::new(
+   |  _____________-
+10 | |         "Sushi Place",
+11 | |         date!(2026 - 07 - 04),
+12 | |         Money::new(4_250, "USD"),
+13 | |     )
+14 | |     .category("Meals");
+   | |     -^^^^^^^^ method not found in `ExpenseLine`
+   | |_____|
+   |

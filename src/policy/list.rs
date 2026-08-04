@@ -1,19 +1,24 @@
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::policy::model::PolicySummary;
-use crate::BoxFuture;
+use crate::wire;
 
 /// Policy List Getter (`type: "get"`, `inputSettings.type: "policyList"`).
 #[must_use = "actions do nothing until awaited"]
 pub struct ListPoliciesAction {
-    client: Client,
-    admin_only: bool,
-    user_email: Option<String>,
+    pub(crate) client: Client,
+    pub(crate) admin_only: bool,
+    pub(crate) user_email: Option<String>,
 }
 
 impl ListPoliciesAction {
     pub(crate) fn new(client: Client) -> Self {
-        Self { client, admin_only: false, user_email: None }
+        Self {
+            client,
+            admin_only: false,
+            user_email: None,
+        }
     }
 
     /// Only policies where the user is an admin (`adminOnly: true`).
@@ -35,8 +40,9 @@ impl IntoFuture for ListPoliciesAction {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let request = wire::list_policies(&self);
+            let response = self.client.send(request).await?;
+            wire::policy_list(response)
         })
     }
 }

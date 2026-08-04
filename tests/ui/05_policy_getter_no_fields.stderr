@@ -1,0 +1,14 @@
+error[E0277]: `GetPoliciesBuilder` is not a future
+ --> tests/ui/05_policy_getter_no_fields.rs:7:49
+  |
+7 |     let _policies = client.get_policies(["P1"]).await?;
+  |                                                 ^^^^^ `GetPoliciesBuilder` is not a future
+  |
+  = help: the trait `Future` is not implemented for `GetPoliciesBuilder`
+  = note: GetPoliciesBuilder must be a future or must implement `IntoFuture` to be awaited
+  = note: required for `GetPoliciesBuilder` to implement `IntoFuture`
+help: remove the `.await`
+  |
+7 -     let _policies = client.get_policies(["P1"]).await?;
+7 +     let _policies = client.get_policies(["P1"])?;
+  |

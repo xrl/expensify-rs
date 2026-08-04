@@ -1,0 +1,8 @@
+error[E0277]: `&NotFetched` is not an iterator
+ --> tests/ui/04_unrequested_policy_field.rs:9:22
+  |
+9 |     for _category in &policies[&id].categories {}
+  |                      ^^^^^^^^^^^^^^^^^^^^^^^^^ `&NotFetched` is not an iterator
+  |
+  = help: the trait `Iterator` is not implemented for `&NotFetched`
+  = note: required for `&NotFetched` to implement `IntoIterator`

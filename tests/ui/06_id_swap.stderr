@@ -1,0 +1,32 @@
+error[E0277]: the trait bound `ReportId: From<PolicyId>` is not satisfied
+  --> tests/ui/06_id_swap.rs:15:16
+   |
+15 |     .report_id(policy);
+   |      --------- ^^^^^^ the trait `From<PolicyId>` is not implemented for `ReportId`
+   |      |
+   |      required by a bound introduced by this call
+   |
+help: `ReportId` implements trait `From<T>`
+  --> src/types.rs
+   |
+   |           impl From<String> for $name {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<String>`
+...
+   |           impl From<&str> for $name {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^ `From<&str>`
+...
+   |           impl From<&$name> for $name {
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `From<&ReportId>`
+...
+   | / string_id! {
+   | |     /// Report identifier (`reportID`), e.g. `R006AseGxMka`.
+   | |     ReportId
+   | | }
+   | |_- in this macro invocation
+   = note: required for `PolicyId` to implement `Into<ReportId>`
+note: required by a bound in `Expense::report_id`
+  --> src/expenses.rs
+   |
+   |     pub fn report_id(mut self, id: impl Into<ReportId>) -> Self {
+   |                                         ^^^^^^^^^^^^^^ required by this bound in `Expense::report_id`
+   = note: this error originates in the macro `string_id` (in Nightly builds, run with -Z macro-backtrace for more info)

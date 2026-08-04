@@ -14,7 +14,10 @@ pub enum Error {
 
     /// HTTP 429 or in-body responseCode 429.
     #[error("rate limited by Expensify")]
-    RateLimited { retry_after: Option<std::time::Duration> },
+    RateLimited {
+        /// From the `Retry-After` header, which Expensify often omits.
+        retry_after: Option<std::time::Duration>,
+    },
 
     /// Expensify rejected the job (`responseCode` != 200/207, from either
     /// the HTTP status or the JSON body).
@@ -24,7 +27,12 @@ pub enum Error {
     /// Non-success HTTP response whose body was not a recognizable
     /// Expensify JSON envelope.
     #[error("HTTP {status}")]
-    Http { status: reqwest::StatusCode, body: String },
+    Http {
+        /// Status line of the failed response.
+        status: reqwest::StatusCode,
+        /// Body as received, lossily decoded as UTF-8.
+        body: String,
+    },
 
     /// Failed to decode a response body or a downloaded export
     /// (via [`crate::FromExport`]).
@@ -39,8 +47,10 @@ pub enum Error {
     PartialSuccess(Box<ReimburseOutcome>),
 }
 
+/// A rejection reported by Expensify itself.
 #[derive(Clone, Debug)]
 pub struct ApiError {
+    /// Coarse classification of [`ApiError::code`].
     pub kind: ApiErrorKind,
     /// Raw `responseCode` (or HTTP status when no body code was present).
     pub code: u16,
@@ -48,6 +58,7 @@ pub struct ApiError {
     pub message: Option<String>,
 }
 
+/// Documented Expensify response-code families.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ApiErrorKind {
@@ -61,14 +72,18 @@ pub enum ApiErrorKind {
     /// authenticate as user", i.e. a capability that support has not
     /// enabled).
     Server,
+    /// Any other code Expensify returns.
     Other,
 }
 
+/// Failure to turn bytes into a value.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DecodeError {
+    /// Malformed JSON, or JSON that did not match the expected shape.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A download declared as text was not valid UTF-8.
     #[error("invalid utf-8: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     /// For user-defined [`crate::FromExport`] implementations.
@@ -77,6 +92,8 @@ pub enum DecodeError {
 }
 
 impl DecodeError {
+    /// Build a [`DecodeError::Custom`]; the intended failure path for a
+    /// caller-side [`crate::FromExport`] impl.
     pub fn custom(msg: impl Into<String>) -> Self {
         Self::Custom(msg.into())
     }

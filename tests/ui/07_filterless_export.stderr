@@ -1,0 +1,23 @@
+error[E0599]: no associated function or constant named `default` found for struct `ReportsQuery` in the current scope
+ --> tests/ui/07_filterless_export.rs:7:27
+  |
+7 |     let _ = ReportsQuery::default();
+  |                           ^^^^^^^ associated function or constant not found in `ReportsQuery`
+  |
+note: if you're trying to build a new `ReportsQuery` consider using one of the following associated functions:
+      ReportsQuery::report_ids
+      ReportsQuery::since
+      ReportsQuery::approved_after
+ --> src/export.rs
+  |
+  | /     pub fn report_ids<I>(ids: I) -> Self
+  | |     where
+  | |         I: IntoIterator,
+  | |         I::Item: Into<ReportId>,
+  | |________________________________^
+...
+  |       pub fn since(start: Date) -> Self {
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+  |       pub fn approved_after(date: Date) -> Self {
+  |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

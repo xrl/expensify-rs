@@ -10,25 +10,31 @@ use crate::expenses::{CreateExpensesAction, Expense};
 use crate::export::{ExportReportsAction, ReportsQuery};
 use crate::file::{DownloadAction, ExportedFile};
 use crate::policy::{
-    CreatePolicyAction, GetPoliciesBuilder, ListPoliciesAction, SetTagApproversAction,
-    TagApprover, UpdatePolicyAction,
+    CreatePolicyAction, GetPoliciesBuilder, ListPoliciesAction, SetTagApproversAction, TagApprover,
+    UpdatePolicyAction,
 };
 use crate::reconciliation::{ReconcileAction, ReconciliationScope};
-use crate::reports::{
-    CreateReportAction, ExpenseLine, ReimburseAction, ReimburseTargets, Strict,
-};
+use crate::reports::{CreateReportAction, ExpenseLine, ReimburseAction, ReimburseTargets, Strict};
 use crate::template::{ExportTemplate, FromExport, ReconciliationTemplate};
 use crate::types::{PolicyId, RuleId};
 
+/// The single production endpoint every job posts to.
+pub(crate) const DEFAULT_ENDPOINT: &str =
+    "https://integrations.expensify.com/Integration-Server/ExpensifyIntegrations";
+
 /// `partnerUserID` / `partnerUserSecret` pair generated at
 /// expensify.com/tools/integrations/.
+///
+/// The secret is shown once by Expensify and is never echoed by this type:
+/// the [`fmt::Debug`] impl redacts it.
 #[derive(Clone)]
 pub struct Credentials {
-    partner_user_id: String,
-    partner_user_secret: String,
+    pub(crate) partner_user_id: String,
+    pub(crate) partner_user_secret: String,
 }
 
 impl Credentials {
+    /// Wrap an ID/secret pair.
     pub fn new(partner_user_id: impl Into<String>, partner_user_secret: impl Into<String>) -> Self {
         Self {
             partner_user_id: partner_user_id.into(),
@@ -48,22 +54,22 @@ impl fmt::Debug for Credentials {
 }
 
 pub(crate) struct RateGate {
-    per_10s: governor::DefaultDirectRateLimiter,
-    per_60s: governor::DefaultDirectRateLimiter,
+    pub(crate) per_10s: governor::DefaultDirectRateLimiter,
+    pub(crate) per_60s: governor::DefaultDirectRateLimiter,
 }
 
-struct ClientInner {
-    http: reqwest::Client,
-    credentials: Credentials,
-    base_url: reqwest::Url,
-    limiter: Option<RateGate>,
+pub(crate) struct ClientInner {
+    pub(crate) http: reqwest::Client,
+    pub(crate) credentials: Credentials,
+    pub(crate) base_url: reqwest::Url,
+    pub(crate) limiter: Option<RateGate>,
 }
 
 /// Entry point. Cheaply cloneable (`Arc` internally); actions hold a
 /// clone, so a `Client` need not outlive the actions it creates.
 #[derive(Clone)]
 pub struct Client {
-    inner: Arc<ClientInner>,
+    pub(crate) inner: Arc<ClientInner>,
 }
 
 impl Client {
@@ -72,6 +78,8 @@ impl Client {
         Self::builder(credentials).build()
     }
 
+    /// Start configuring a client (custom endpoint, HTTP client, or no
+    /// rate limiting).
     pub fn builder(credentials: Credentials) -> ClientBuilder {
         ClientBuilder {
             credentials,
@@ -101,6 +109,7 @@ impl Client {
 
     // ---- policies ---------------------------------------------------
 
+    /// Policy List Getter: every policy the credentials can see.
     pub fn list_policies(&self) -> ListPoliciesAction {
         ListPoliciesAction::new(self.clone())
     }
@@ -113,13 +122,19 @@ impl Client {
         I: IntoIterator,
         I::Item: Into<PolicyId>,
     {
-        GetPoliciesBuilder::new(self.clone(), policy_ids.into_iter().map(Into::into).collect())
+        GetPoliciesBuilder::new(
+            self.clone(),
+            policy_ids.into_iter().map(Into::into).collect(),
+        )
     }
 
+    /// Policy Creator.
     pub fn create_policy(&self, name: impl Into<String>) -> CreatePolicyAction {
         CreatePolicyAction::new(self.clone(), name.into())
     }
 
+    /// Policy Updater for one policy. Requires policy-admin credentials
+    /// (Expensify answers 403 otherwise).
     pub fn update_policy(&self, policy_id: impl Into<PolicyId>) -> UpdatePolicyAction {
         UpdatePolicyAction::new(self.clone(), vec![policy_id.into()])
     }
@@ -130,9 +145,14 @@ impl Client {
         I: IntoIterator,
         I::Item: Into<PolicyId>,
     {
-        UpdatePolicyAction::new(self.clone(), policy_ids.into_iter().map(Into::into).collect())
+        UpdatePolicyAction::new(
+            self.clone(),
+            policy_ids.into_iter().map(Into::into).collect(),
+        )
     }
 
+    /// Tag Approvers Updater. Requires policy-admin credentials and a
+    /// single-level tag list; both are server-enforced.
     pub fn set_tag_approvers<I>(
         &self,
         policy_id: impl Into<PolicyId>,
@@ -150,6 +170,12 @@ impl Client {
 
     // ---- reports & expenses -----------------------------------------
 
+    /// Report Creator.
+    ///
+    /// Restricted: Expensify support must enable report creation for your
+    /// domain, and the credentials need both domain-admin and policy-admin
+    /// rights. Without that the job fails with "Not authorized to
+    /// authenticate as user" as an [`Error::Api`](crate::Error::Api).
     pub fn create_report<I>(
         &self,
         policy_id: impl Into<PolicyId>,
@@ -169,6 +195,8 @@ impl Client {
         )
     }
 
+    /// Expense Creator. Expenses land in the credential owner's account
+    /// unless [`CreateExpensesAction::employee_email`] says otherwise.
     pub fn create_expenses<I>(&self, expenses: I) -> CreateExpensesAction
     where
         I: IntoIterator<Item = Expense>,
@@ -184,6 +212,9 @@ impl Client {
 
     // ---- expense rules ----------------------------------------------
 
+    /// Expense Rules Creator. Set at least one action
+    /// ([`CreateExpenseRuleAction::tag`] or
+    /// [`CreateExpenseRuleAction::default_billable`]).
     pub fn create_expense_rule(
         &self,
         policy_id: impl Into<PolicyId>,
@@ -192,6 +223,7 @@ impl Client {
         CreateExpenseRuleAction::new(self.clone(), policy_id.into(), employee_email.into())
     }
 
+    /// Expense Rules Updater.
     pub fn update_expense_rule(
         &self,
         policy_id: impl Into<PolicyId>,
@@ -208,7 +240,8 @@ impl Client {
 
     // ---- employees --------------------------------------------------
 
-    /// Advanced Employee Updater.
+    /// Advanced Employee Updater. Requires domain-admin credentials
+    /// (server-enforced).
     pub fn update_employees(&self, source: EmployeeSource) -> UpdateEmployeesAction {
         UpdateEmployeesAction::new(self.clone(), source)
     }
@@ -232,7 +265,10 @@ impl Client {
     /// capability claim: Expensify still checks that the credentials are
     /// a domain admin.
     pub fn domain(&self, domain: impl Into<String>) -> DomainClient {
-        DomainClient { client: self.clone(), domain: domain.into() }
+        DomainClient {
+            client: self.clone(),
+            domain: domain.into(),
+        }
     }
 }
 
@@ -245,6 +281,8 @@ impl fmt::Debug for Client {
     }
 }
 
+/// Configures a [`Client`]. Obtain one from [`Client::builder`].
+#[must_use = "builders do nothing until `build()` is called"]
 pub struct ClientBuilder {
     credentials: Credentials,
     base_url: Option<reqwest::Url>,
@@ -272,8 +310,26 @@ impl ClientBuilder {
         self
     }
 
+    /// Finish configuration.
+    ///
+    /// # Panics
+    ///
+    /// Only if the compiled-in default endpoint fails to parse, which
+    /// cannot happen for a caller-visible reason.
     pub fn build(self) -> Client {
-        todo!()
+        let base_url = self.base_url.unwrap_or_else(|| {
+            DEFAULT_ENDPOINT
+                .parse()
+                .expect("compiled-in endpoint is a valid URL")
+        });
+        Client {
+            inner: Arc::new(ClientInner {
+                http: self.http.unwrap_or_default(),
+                credentials: self.credentials,
+                base_url,
+                limiter: self.rate_limiting.then(RateGate::new),
+            }),
+        }
     }
 }
 
@@ -285,12 +341,16 @@ pub struct DomainClient {
 }
 
 impl DomainClient {
+    /// The domain this client is scoped to.
     pub fn name(&self) -> &str {
         &self.domain
     }
 
     /// Reconciliation job. Resolves to an [`ExportedFile`] on the
     /// `reconciliation` file system (set here, not by the caller).
+    ///
+    /// Requires domain-admin credentials for this domain; Expensify
+    /// answers 403 otherwise.
     pub fn reconcile<F>(
         &self,
         template: &ReconciliationTemplate<F>,
@@ -308,8 +368,29 @@ impl DomainClient {
         )
     }
 
-    /// Domain Cards Getter.
+    /// Domain Cards Getter. Requires domain-admin credentials.
     pub fn card_list(&self) -> DomainCardListAction {
         DomainCardListAction::new(self.client.clone(), self.domain.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_secret() {
+        let creds = Credentials::new("partner-id", "hunter2-super-secret");
+        let rendered = format!("{creds:?}");
+        assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+        assert!(rendered.contains("partner-id"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    fn client_debug_redacts_the_secret() {
+        let client = Client::new(Credentials::new("partner-id", "hunter2-super-secret"));
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
     }
 }

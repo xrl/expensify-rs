@@ -1,9 +1,12 @@
 //! The design doc's running example: month-end close.
-//! Compiles against the skeleton; panics at runtime (bodies are stubs).
+//! Needs live Expensify credentials to do anything.
+
+// `129_00` reads as dollars-and-cents, which is the point.
+#![allow(clippy::inconsistent_digit_grouping)]
 
 use expensify::{
-    Client, Credentials, Expense, ExpenseTax, ExportTemplate, Json, Money, PolicyId, ReportId,
-    ReportState, ReportsQuery, ReimburseTargets,
+    Client, Credentials, Expense, ExpenseTax, ExportFormat, ExportTemplate, Json, Money, PolicyId,
+    ReimburseTargets, ReportId, ReportState, ReportsQuery,
 };
 use serde::Deserialize;
 use time::macros::date;
@@ -35,23 +38,30 @@ async fn month_end_close(client: &Client, policy: PolicyId) -> Result<(), expens
                 .not_yet_exported_as("acme-etl"),
         )
         .state(ReportState::Approved)
+        // The default is csv for every marker, including Json<_>.
+        .format(ExportFormat::Json)
         .mark_as_exported("acme-etl")
         .await?;
 
     // 2. Download: decodes straight into the template's row type.
     let rows: Vec<ReportRow> = client.download(&file).await?;
     for row in &rows {
-        println!("{}: {} cents ({})", row.report_id, row.total_cents, row.employee);
+        println!(
+            "{}: {} cents ({})",
+            row.report_id, row.total_cents, row.employee
+        );
     }
 
     // 3. Book July's hosting bill as an expense.
     let created = client
-        .create_expenses([
-            Expense::new("Cloud Hosting Inc", date!(2026 - 07 - 31), Money::new(129_00, "USD"))
-                .category("Infrastructure")
-                .external_id("hosting-2026-07")
-                .tax(ExpenseTax::new("id_TAX_OPTION_16")),
-        ])
+        .create_expenses([Expense::new(
+            "Cloud Hosting Inc",
+            date!(2026 - 07 - 31),
+            Money::new(129_00, "USD"),
+        )
+        .category("Infrastructure")
+        .external_id("hosting-2026-07")
+        .tax(ExpenseTax::new("id_TAX_OPTION_16"))])
         .await?;
     println!("created {} transactions", created.len());
 

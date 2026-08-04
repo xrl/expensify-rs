@@ -1,0 +1,5 @@
+error[E0609]: no field `skipped` on type `Vec<ReportId>`
+  --> tests/ui/08_silent_partial_reimbursement.rs:12:21
+   |
+12 |     let _ = outcome.skipped;
+   |                     ^^^^^^^ unknown field

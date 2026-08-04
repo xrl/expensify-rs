@@ -1,0 +1,9 @@
+error[E0308]: `?` operator has incompatible types
+  --> tests/ui/02_wrong_download_type.rs:11:30
+   |
+11 |     let _rows: Vec<String> = client.download(&file).await?;
+   |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `Vec<String>`, found `Vec<i64>`
+   |
+   = note: `?` operator cannot convert from `Vec<i64>` to `Vec<String>`
+   = note: expected struct `Vec<String>`
+              found struct `Vec<i64>`

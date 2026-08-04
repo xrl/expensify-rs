@@ -2,10 +2,11 @@ use std::marker::PhantomData;
 
 use time::Date;
 
-use crate::client::Client;
-use crate::error::Error;
-use crate::types::{Money, PolicyId, ReportId};
 use crate::BoxFuture;
+use crate::client::Client;
+use crate::error::{DecodeError, Error};
+use crate::types::{Money, PolicyId, ReportId};
+use crate::wire;
 
 /// An expense line for the Report Creator. Deliberately narrower than
 /// [`crate::Expense`]: the report-creation job only accepts these four
@@ -13,31 +14,38 @@ use crate::BoxFuture;
 /// dropped.
 #[derive(Clone, Debug)]
 pub struct ExpenseLine {
-    merchant: String,
-    date: Date,
-    amount: Money,
+    pub(crate) merchant: String,
+    pub(crate) date: Date,
+    pub(crate) amount: Money,
 }
 
 impl ExpenseLine {
+    /// The only constructor; there are no setters by design.
     pub fn new(merchant: impl Into<String>, date: Date, amount: Money) -> Self {
-        Self { merchant: merchant.into(), date, amount }
+        Self {
+            merchant: merchant.into(),
+            date,
+            amount,
+        }
     }
 }
 
 /// Report Creator (`type: "create"`, `inputSettings.type: "report"`).
-/// Requires Expensify support to have enabled report creation for the
-/// domain, and domain+policy admin credentials; a persistent
-/// "Not authorized to authenticate as user" [`Error::Api`] means it is
-/// not enabled.
+///
+/// Restricted: Expensify support must enable report creation for the
+/// domain, and the credentials need both domain-admin and policy-admin
+/// rights. A persistent "Not authorized to authenticate as user"
+/// [`Error::Api`] means it is not enabled — no amount of client-side
+/// correctness will fix it.
 #[must_use = "actions do nothing until awaited"]
 pub struct CreateReportAction {
-    client: Client,
-    policy_id: PolicyId,
-    employee_email: String,
-    title: String,
-    fields: serde_json::Map<String, serde_json::Value>,
-    fields_error: Option<serde_json::Error>,
-    expenses: Vec<ExpenseLine>,
+    pub(crate) client: Client,
+    pub(crate) policy_id: PolicyId,
+    pub(crate) employee_email: String,
+    pub(crate) title: String,
+    pub(crate) fields: serde_json::Map<String, serde_json::Value>,
+    pub(crate) fields_error: Option<serde_json::Error>,
+    pub(crate) expenses: Vec<ExpenseLine>,
 }
 
 impl CreateReportAction {
@@ -62,21 +70,37 @@ impl CreateReportAction {
     /// Set one report field. Keys are normalized to Expensify's rule
     /// (non-alphanumerics become underscores) before sending.
     pub fn report_field(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.fields.insert(name.into(), serde_json::Value::String(value.into()));
+        self.fields
+            .insert(name.into(), serde_json::Value::String(value.into()));
         self
     }
 
     /// Set report fields from any `Serialize` type that serializes to a
     /// JSON object (map or struct). Serialization happens eagerly; a
-    /// failure surfaces from the eventual `.await`.
-    pub fn report_fields<T: serde::Serialize>(self, fields: &T) -> Self {
-        todo!()
+    /// failure — including a value that is not an object — surfaces from
+    /// the eventual `.await`.
+    pub fn report_fields<T: serde::Serialize>(mut self, fields: &T) -> Self {
+        match serde_json::to_value(fields) {
+            Ok(serde_json::Value::Object(map)) => self.fields.extend(map),
+            Ok(_) => {
+                self.fields_error.get_or_insert_with(|| {
+                    serde::de::Error::custom("report_fields must serialize to a JSON object")
+                });
+            }
+            Err(err) => {
+                self.fields_error.get_or_insert(err);
+            }
+        }
+        self
     }
 }
 
+/// Result of a successful Report Creator run.
 #[derive(Clone, Debug)]
 pub struct CreatedReport {
+    /// Identifier of the new report.
     pub report_id: ReportId,
+    /// Name as stored by Expensify (`reportName`).
     pub name: String,
 }
 
@@ -84,10 +108,14 @@ impl IntoFuture for CreateReportAction {
     type Output = Result<CreatedReport, Error>;
     type IntoFuture = BoxFuture<Self::Output>;
 
-    fn into_future(self) -> Self::IntoFuture {
+    fn into_future(mut self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            if let Some(err) = self.fields_error.take() {
+                return Err(DecodeError::Json(err).into());
+            }
+            let request = wire::create_report(&self);
+            let response = self.client.send(request).await?;
+            wire::created_report(response)
         })
     }
 }
@@ -96,12 +124,13 @@ impl IntoFuture for CreateReportAction {
 /// Expensify requires `reportIDList` or `startDate`.
 #[derive(Clone, Debug)]
 pub struct ReimburseTargets {
-    report_ids: Vec<ReportId>,
-    start_date: Option<Date>,
-    end_date: Option<Date>,
+    pub(crate) report_ids: Vec<ReportId>,
+    pub(crate) start_date: Option<Date>,
+    pub(crate) end_date: Option<Date>,
 }
 
 impl ReimburseTargets {
+    /// Specific reports.
     pub fn report_ids<I>(ids: I) -> Self
     where
         I: IntoIterator,
@@ -114,10 +143,16 @@ impl ReimburseTargets {
         }
     }
 
+    /// Reports whose latest of submitted/created falls on or after `start`.
     pub fn since(start: Date) -> Self {
-        Self { report_ids: Vec::new(), start_date: Some(start), end_date: None }
+        Self {
+            report_ids: Vec::new(),
+            start_date: Some(start),
+            end_date: None,
+        }
     }
 
+    /// Close the window (inclusive).
     pub fn until(mut self, end: Date) -> Self {
         self.end_date = Some(end);
         self
@@ -147,7 +182,12 @@ pub struct ReimburseAction<Mode = Strict> {
 
 impl ReimburseAction<Strict> {
     pub(crate) fn new(client: Client, targets: ReimburseTargets) -> Self {
-        Self { client, targets, payment_source: None, _mode: PhantomData }
+        Self {
+            client,
+            targets,
+            payment_source: None,
+            _mode: PhantomData,
+        }
     }
 
     /// Accept partial success: skipped and failed reports become data in
@@ -169,11 +209,21 @@ impl<Mode> ReimburseAction<Mode> {
         self.payment_source = Some(source.into());
         self
     }
+
+    async fn run(self) -> Result<(bool, ReimburseOutcome), Error> {
+        let request = wire::reimburse(&self.targets, self.payment_source.as_deref());
+        let response = self.client.send(request).await?;
+        let partial = wire::is_partial(&response);
+        Ok((partial, wire::reimburse_outcome(response)?))
+    }
 }
 
+/// A report the reimbursement did not update, and why.
 #[derive(Clone, Debug)]
 pub struct SkippedReport {
+    /// The report in question.
     pub report_id: ReportId,
+    /// Expensify's explanation, e.g. `Report is in status 'Open'`.
     pub reason: String,
 }
 
@@ -181,6 +231,7 @@ pub struct SkippedReport {
 /// [`Error::PartialSuccess`] on the strict path).
 #[derive(Clone, Debug)]
 pub struct ReimburseOutcome {
+    /// Reports moved to Reimbursed.
     pub updated: Vec<ReportId>,
     /// Reports in a non-Approved status.
     pub skipped: Vec<SkippedReport>,
@@ -195,8 +246,11 @@ impl IntoFuture for ReimburseAction<Strict> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let (partial, outcome) = self.run().await?;
+            if partial {
+                return Err(Error::PartialSuccess(Box::new(outcome)));
+            }
+            Ok(outcome.updated)
         })
     }
 }
@@ -207,9 +261,6 @@ impl IntoFuture for ReimburseAction<Tolerant> {
     type IntoFuture = BoxFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move {
-            let _ = self;
-            todo!()
-        })
+        Box::pin(async move { self.run().await.map(|(_, outcome)| outcome) })
     }
 }

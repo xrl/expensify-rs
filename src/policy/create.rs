@@ -1,8 +1,9 @@
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::policy::model::PolicyPlan;
 use crate::types::PolicyId;
-use crate::BoxFuture;
+use crate::wire;
 
 /// Policy Creator (`type: "create"`, `inputSettings.type: "policy"`).
 #[must_use = "actions do nothing until awaited"]
@@ -14,7 +15,11 @@ pub struct CreatePolicyAction {
 
 impl CreatePolicyAction {
     pub(crate) fn new(client: Client, name: String) -> Self {
-        Self { client, name, plan: None }
+        Self {
+            client,
+            name,
+            plan: None,
+        }
     }
 
     /// Default: [`PolicyPlan::Team`] (server default).
@@ -24,9 +29,12 @@ impl CreatePolicyAction {
     }
 }
 
+/// Result of a successful Policy Creator run.
 #[derive(Clone, Debug)]
 pub struct CreatedPolicy {
+    /// Identifier of the new policy.
     pub policy_id: PolicyId,
+    /// Name as stored by Expensify.
     pub name: String,
 }
 
@@ -36,8 +44,9 @@ impl IntoFuture for CreatePolicyAction {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let request = wire::create_policy(&self.name, self.plan);
+            let response = self.client.send(request).await?;
+            wire::created_policy(response)
         })
     }
 }

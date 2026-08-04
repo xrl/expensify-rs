@@ -2,37 +2,40 @@ use std::marker::PhantomData;
 
 use time::Date;
 
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::export::ExportFormat;
 use crate::file::{ExportedFile, FileSystem};
 use crate::template::ReconciliationTemplate;
-use crate::BoxFuture;
+use crate::wire;
 
 /// `inputSettings.type` of the reconciliation job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconciliationScope {
-    /// Card transactions not yet on any report.
+    /// Card transactions not yet on any report. They appear in the template
+    /// data model under a synthetic report with id `0`.
     Unreported,
     /// All card transactions in the window.
     All,
 }
 
 /// Reconciliation job (`type: "reconciliation"`). Domain-admin credentials
-/// required (server-enforced). Synchronous server-side (`async: false` is
-/// the only supported mode and is not exposed); the resolved
-/// [`ExportedFile`] is immediately downloadable.
+/// required (server-enforced; a non-admin credential gets
+/// [`ApiErrorKind::InvalidPermissions`](crate::ApiErrorKind::InvalidPermissions)).
+/// Synchronous server-side (`async: false` is the only supported mode and is
+/// not exposed); the resolved [`ExportedFile`] is immediately downloadable.
 #[must_use = "actions do nothing until awaited"]
 pub struct ReconcileAction<F> {
-    client: Client,
-    domain: String,
-    template: String,
-    start: Date,
-    end: Date,
-    scope: ReconciliationScope,
-    feed: Option<String>,
-    format: Option<ExportFormat>,
-    email_on_finish: Option<String>,
+    pub(crate) client: Client,
+    pub(crate) domain: String,
+    pub(crate) template: String,
+    pub(crate) start: Date,
+    pub(crate) end: Date,
+    pub(crate) scope: ReconciliationScope,
+    pub(crate) feed: Option<String>,
+    pub(crate) format: Option<ExportFormat>,
+    pub(crate) email_on_finish: Option<String>,
     _out: PhantomData<fn() -> F>,
 }
 
@@ -86,9 +89,14 @@ impl<F: 'static> IntoFuture for ReconcileAction<F> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = FileSystem::Reconciliation; // producer pins the file system
-            let _ = self;
-            todo!()
+            let request = wire::reconcile(&self);
+            let response = self.client.send(request).await?;
+            let name = wire::filename(response)?;
+            // The producer pins the file system; download never asks.
+            Ok(ExportedFile::from_response(
+                name,
+                FileSystem::Reconciliation,
+            ))
         })
     }
 }

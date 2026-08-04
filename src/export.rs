@@ -2,27 +2,29 @@ use std::marker::PhantomData;
 
 use time::Date;
 
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::file::{ExportedFile, FileSystem};
 use crate::template::ExportTemplate;
 use crate::types::{PolicyId, ReportId};
-use crate::BoxFuture;
+use crate::wire;
 
 /// Which reports an export selects. Constructors anchor the "at least one
 /// of reportIDList / startDate / approvedAfter" requirement: an empty
 /// query is unrepresentable.
 #[derive(Clone, Debug)]
 pub struct ReportsQuery {
-    report_ids: Vec<ReportId>,
-    start_date: Option<Date>,
-    end_date: Option<Date>,
-    approved_after: Option<Date>,
-    policy_ids: Vec<PolicyId>,
-    marked_as_exported: Option<String>,
+    pub(crate) report_ids: Vec<ReportId>,
+    pub(crate) start_date: Option<Date>,
+    pub(crate) end_date: Option<Date>,
+    pub(crate) approved_after: Option<Date>,
+    pub(crate) policy_ids: Vec<PolicyId>,
+    pub(crate) marked_as_exported: Option<String>,
 }
 
 impl ReportsQuery {
+    /// Specific reports (`filters.reportIDList`).
     pub fn report_ids<I>(ids: I) -> Self
     where
         I: IntoIterator,
@@ -69,6 +71,7 @@ impl ReportsQuery {
         self
     }
 
+    /// Restrict to these policies (`filters.policyIDList`).
     pub fn policy_ids<I>(mut self, ids: I) -> Self
     where
         I: IntoIterator,
@@ -86,57 +89,91 @@ impl ReportsQuery {
     }
 }
 
+/// A report's workflow state (`reportState`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportState {
+    /// Draft, not yet submitted.
     Open,
+    /// Submitted, awaiting approval.
     Submitted,
+    /// Approved, not yet reimbursed.
     Approved,
+    /// Reimbursed.
     Reimbursed,
+    /// Archived.
     Archived,
 }
 
 /// `outputSettings.fileExtension`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportFormat {
+    /// Comma-separated values (the server default).
     Csv,
+    /// Legacy Excel workbook.
     Xls,
+    /// Excel workbook.
     Xlsx,
+    /// Plain text.
     Txt,
+    /// PDF — note that Expensify emits one file *per report*, which this
+    /// crate's single-[`ExportedFile`] model does not represent.
     Pdf,
+    /// JSON; pair with a [`Json`](crate::Json) template marker.
     Json,
+    /// XML.
     Xml,
 }
 
+/// SFTP endpoint, shared by the exporter's `sftpUpload` action and the
+/// employee updater's SFTP feed source.
 #[derive(Clone, Debug)]
 pub struct SftpConnection {
+    /// Hostname or IP.
     pub host: String,
+    /// Username.
     pub login: String,
+    /// Password.
     pub password: String,
+    /// Port, usually 22.
     pub port: u16,
 }
 
 /// An `onFinish` action for the Report Exporter.
 #[derive(Clone, Debug)]
 pub struct OnFinish {
-    kind: OnFinishKind,
+    pub(crate) kind: OnFinishKind,
 }
 
 #[derive(Clone, Debug)]
-enum OnFinishKind {
-    MarkAsExported { label: String },
-    Email { recipients: String, message: Option<String> },
+pub(crate) enum OnFinishKind {
+    MarkAsExported {
+        label: String,
+    },
+    Email {
+        recipients: String,
+        message: Option<String>,
+    },
     SftpUpload(SftpConnection),
 }
 
 impl OnFinish {
+    /// Tag the exported reports with `label` so a later
+    /// [`ReportsQuery::not_yet_exported_as`] skips them.
     pub fn mark_as_exported(label: impl Into<String>) -> Self {
-        Self { kind: OnFinishKind::MarkAsExported { label: label.into() } }
+        Self {
+            kind: OnFinishKind::MarkAsExported {
+                label: label.into(),
+            },
+        }
     }
 
     /// Comma-separate multiple recipients (wire format).
     pub fn email(recipients: impl Into<String>) -> Self {
         Self {
-            kind: OnFinishKind::Email { recipients: recipients.into(), message: None },
+            kind: OnFinishKind::Email {
+                recipients: recipients.into(),
+                message: None,
+            },
         }
     }
 
@@ -148,8 +185,12 @@ impl OnFinish {
         self
     }
 
+    /// Upload the rendered file to an SFTP server. The destination folder
+    /// is the SFTP user's home directory; there is no path parameter.
     pub fn sftp_upload(connection: SftpConnection) -> Self {
-        Self { kind: OnFinishKind::SftpUpload(connection) }
+        Self {
+            kind: OnFinishKind::SftpUpload(connection),
+        }
     }
 }
 
@@ -160,17 +201,17 @@ impl OnFinish {
 /// server-side.
 #[must_use = "actions do nothing until awaited"]
 pub struct ExportReportsAction<F> {
-    client: Client,
-    template: String,
-    query: ReportsQuery,
-    states: Vec<ReportState>,
-    limit: Option<u32>,
-    employee_email: Option<String>,
-    format: Option<ExportFormat>,
-    file_basename: Option<String>,
-    include_full_page_receipts_pdf: bool,
-    on_finish: Vec<OnFinish>,
-    test: bool,
+    pub(crate) client: Client,
+    pub(crate) template: String,
+    pub(crate) query: ReportsQuery,
+    pub(crate) states: Vec<ReportState>,
+    pub(crate) limit: Option<u32>,
+    pub(crate) employee_email: Option<String>,
+    pub(crate) format: Option<ExportFormat>,
+    pub(crate) file_basename: Option<String>,
+    pub(crate) include_full_page_receipts_pdf: bool,
+    pub(crate) on_finish: Vec<OnFinish>,
+    pub(crate) test: bool,
     _out: PhantomData<fn() -> F>,
 }
 
@@ -199,31 +240,38 @@ impl<F> ExportReportsAction<F> {
         self
     }
 
+    /// Cap the number of exported reports.
     pub fn limit(mut self, limit: u32) -> Self {
         self.limit = Some(limit);
         self
     }
 
-    /// Export a single employee's reports. Restricted: requires Expensify
-    /// to have granted the credential access to the employee's domain, and
-    /// blocks exporting OPEN reports.
+    /// Export a single employee's reports.
+    ///
+    /// Restricted: Expensify must have granted the credential access to the
+    /// employee's domain, otherwise the job fails with
+    /// [`ApiErrorKind::InvalidPermissions`](crate::ApiErrorKind::InvalidPermissions).
+    /// It also blocks exporting OPEN reports.
     pub fn employee_email(mut self, email: impl Into<String>) -> Self {
         self.employee_email = Some(email.into());
         self
     }
 
-    /// Default: [`ExportFormat::Csv`] for untyped templates,
-    /// [`ExportFormat::Json`] when the template marker is [`crate::Json`].
+    /// Default: [`ExportFormat::Csv`] for every template marker, including
+    /// [`Json`](crate::Json) — the format is not derived from the marker.
     pub fn format(mut self, format: ExportFormat) -> Self {
         self.format = Some(format);
         self
     }
 
+    /// Filename stem (`outputSettings.fileBasename`, default `export`).
+    /// Expensify appends a random suffix regardless.
     pub fn file_basename(mut self, basename: impl Into<String>) -> Self {
         self.file_basename = Some(basename.into());
         self
     }
 
+    /// PDF exports only: embed full-page receipt images.
     pub fn include_full_page_receipts_pdf(mut self) -> Self {
         self.include_full_page_receipts_pdf = true;
         self
@@ -240,7 +288,7 @@ impl<F> ExportReportsAction<F> {
         self.on_finish(OnFinish::mark_as_exported(label))
     }
 
-    /// Sets `test: "true"`: Expensify skips all `onFinish` actions.
+    /// Sets `test`: Expensify skips all `onFinish` actions.
     pub fn test_run(mut self) -> Self {
         self.test = true;
         self
@@ -253,9 +301,14 @@ impl<F: 'static> IntoFuture for ExportReportsAction<F> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = FileSystem::IntegrationServer; // producer pins the file system
-            let _ = self;
-            todo!()
+            let request = wire::export_reports(&self);
+            let response = self.client.send(request).await?;
+            let name = wire::filename(response)?;
+            // The producer pins the file system; download never asks.
+            Ok(ExportedFile::from_response(
+                name,
+                FileSystem::IntegrationServer,
+            ))
         })
     }
 }

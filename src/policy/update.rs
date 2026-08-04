@@ -1,50 +1,68 @@
 use bytes::Bytes;
 
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::policy::model::{Category, PolicyTag, ReportFieldDef};
 use crate::types::PolicyId;
-use crate::BoxFuture;
+use crate::wire;
 
 /// Merge-vs-replace for a Policy Updater section. `ReplaceAll` deletes
 /// everything not in the submitted list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UpdateMode {
+pub(crate) enum UpdateMode {
     Merge,
     ReplaceAll,
 }
 
+/// Category section of a Policy Updater request.
 #[derive(Clone, Debug)]
 pub struct CategoriesUpdate {
-    mode: UpdateMode,
-    data: Vec<Category>,
+    pub(crate) mode: UpdateMode,
+    pub(crate) data: Vec<Category>,
 }
 
 impl CategoriesUpdate {
     /// Update/add the listed categories, keep the rest (`action: "merge"`).
     pub fn merge<I: IntoIterator<Item = Category>>(categories: I) -> Self {
-        Self { mode: UpdateMode::Merge, data: categories.into_iter().collect() }
+        Self {
+            mode: UpdateMode::Merge,
+            data: categories.into_iter().collect(),
+        }
     }
 
-    /// Replace the entire category list (`action: "replace"`). Destructive.
+    /// Replace the entire category list (`action: "replace"`). Destructive:
+    /// categories absent from `categories` are deleted.
     pub fn replace_all<I: IntoIterator<Item = Category>>(categories: I) -> Self {
-        Self { mode: UpdateMode::ReplaceAll, data: categories.into_iter().collect() }
+        Self {
+            mode: UpdateMode::ReplaceAll,
+            data: categories.into_iter().collect(),
+        }
     }
 }
 
+/// Report-field section of a Policy Updater request.
 #[derive(Clone, Debug)]
 pub struct ReportFieldsUpdate {
-    mode: UpdateMode,
-    data: Vec<ReportFieldDef>,
+    pub(crate) mode: UpdateMode,
+    pub(crate) data: Vec<ReportFieldDef>,
 }
 
 impl ReportFieldsUpdate {
+    /// Update/add the listed fields, keep the rest.
     pub fn merge<I: IntoIterator<Item = ReportFieldDef>>(fields: I) -> Self {
-        Self { mode: UpdateMode::Merge, data: fields.into_iter().collect() }
+        Self {
+            mode: UpdateMode::Merge,
+            data: fields.into_iter().collect(),
+        }
     }
 
+    /// Replace the entire report-field list. Destructive.
     pub fn replace_all<I: IntoIterator<Item = ReportFieldDef>>(fields: I) -> Self {
-        Self { mode: UpdateMode::ReplaceAll, data: fields.into_iter().collect() }
+        Self {
+            mode: UpdateMode::ReplaceAll,
+            data: fields.into_iter().collect(),
+        }
     }
 }
 
@@ -56,19 +74,27 @@ pub struct TagLevel {
     pub name: Option<String>,
     /// Whether a tag from this level is required on each expense.
     pub required: bool,
+    /// The tags in this level.
     pub tags: Vec<PolicyTag>,
 }
 
 impl TagLevel {
+    /// Unnamed and optional by default.
     pub fn new<I: IntoIterator<Item = PolicyTag>>(tags: I) -> Self {
-        Self { name: None, required: false, tags: tags.into_iter().collect() }
+        Self {
+            name: None,
+            required: false,
+            tags: tags.into_iter().collect(),
+        }
     }
 
+    /// Name the level.
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    /// Require a tag from this level on every expense.
     pub fn required(mut self) -> Self {
         self.required = true;
         self
@@ -81,11 +107,11 @@ impl TagLevel {
 /// the wrong pairing is unrepresentable.
 #[derive(Clone, Debug)]
 pub struct TagCsvConfig {
-    dependent: bool,
-    set_required: Vec<bool>,
-    gl_codes: bool,
-    header_row: bool,
-    tsv: bool,
+    pub(crate) dependent: bool,
+    pub(crate) set_required: Vec<bool>,
+    pub(crate) gl_codes: bool,
+    pub(crate) header_row: bool,
+    pub(crate) tsv: bool,
 }
 
 impl TagCsvConfig {
@@ -124,6 +150,7 @@ impl TagCsvConfig {
         self
     }
 
+    /// Tab-separated rather than comma-separated.
     pub fn tsv(mut self) -> Self {
         self.tsv = true;
         self
@@ -131,18 +158,21 @@ impl TagCsvConfig {
 }
 
 #[derive(Clone, Debug)]
-enum TagsSource {
+pub(crate) enum TagsSource {
     Inline(Vec<TagLevel>),
     Csv { data: Bytes, config: TagCsvConfig },
 }
 
+/// Tag section of a Policy Updater request.
 #[derive(Clone, Debug)]
 pub struct TagsUpdate {
-    mode: UpdateMode,
-    source: TagsSource,
+    pub(crate) mode: UpdateMode,
+    pub(crate) source: TagsSource,
 }
 
 impl TagsUpdate {
+    /// Update/add the listed levels and tags, keep the rest. Independent
+    /// levels only; the inline form has no dependency knob.
     pub fn merge_inline<I: IntoIterator<Item = TagLevel>>(levels: I) -> Self {
         Self {
             mode: UpdateMode::Merge,
@@ -150,6 +180,7 @@ impl TagsUpdate {
         }
     }
 
+    /// Replace the entire tag list from inline levels. Destructive.
     pub fn replace_all_inline<I: IntoIterator<Item = TagLevel>>(levels: I) -> Self {
         Self {
             mode: UpdateMode::ReplaceAll,
@@ -157,18 +188,26 @@ impl TagsUpdate {
         }
     }
 
-    /// Tag data uploaded in the separate `file` form field.
+    /// Tag data uploaded in the separate `file` form field. Non-UTF-8 bytes
+    /// are replaced, since the field is urlencoded text.
     pub fn merge_csv(data: impl Into<Bytes>, config: TagCsvConfig) -> Self {
         Self {
             mode: UpdateMode::Merge,
-            source: TagsSource::Csv { data: data.into(), config },
+            source: TagsSource::Csv {
+                data: data.into(),
+                config,
+            },
         }
     }
 
+    /// Replace the entire tag list from a CSV/TSV upload. Destructive.
     pub fn replace_all_csv(data: impl Into<Bytes>, config: TagCsvConfig) -> Self {
         Self {
             mode: UpdateMode::ReplaceAll,
-            source: TagsSource::Csv { data: data.into(), config },
+            source: TagsSource::Csv {
+                data: data.into(),
+                config,
+            },
         }
     }
 }
@@ -176,13 +215,15 @@ impl TagsUpdate {
 /// Policy Updater (`type: "update"`, `inputSettings.type: "policy"`).
 /// Sections are independent; set any subset. Awaiting with no section set
 /// is a no-op request the server accepts.
+///
+/// Requires policy-admin credentials (server-enforced).
 #[must_use = "actions do nothing until awaited"]
 pub struct UpdatePolicyAction {
-    client: Client,
-    policy_ids: Vec<PolicyId>,
-    categories: Option<CategoriesUpdate>,
-    report_fields: Option<ReportFieldsUpdate>,
-    tags: Option<TagsUpdate>,
+    pub(crate) client: Client,
+    pub(crate) policy_ids: Vec<PolicyId>,
+    pub(crate) categories: Option<CategoriesUpdate>,
+    pub(crate) report_fields: Option<ReportFieldsUpdate>,
+    pub(crate) tags: Option<TagsUpdate>,
 }
 
 impl UpdatePolicyAction {
@@ -196,16 +237,19 @@ impl UpdatePolicyAction {
         }
     }
 
+    /// Set the categories section.
     pub fn categories(mut self, update: CategoriesUpdate) -> Self {
         self.categories = Some(update);
         self
     }
 
+    /// Set the report-fields section.
     pub fn report_fields(mut self, update: ReportFieldsUpdate) -> Self {
         self.report_fields = Some(update);
         self
     }
 
+    /// Set the tags section.
     pub fn tags(mut self, update: TagsUpdate) -> Self {
         self.tags = Some(update);
         self
@@ -218,8 +262,9 @@ impl IntoFuture for UpdatePolicyAction {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let request = wire::update_policy(&self);
+            self.client.send(request).await?;
+            Ok(())
         })
     }
 }

@@ -1,0 +1,10 @@
+error[E0599]: no method named `status` found for struct `ReimburseAction<Mode>` in the current scope
+  --> tests/ui/09_other_report_status.rs:11:10
+   |
+ 9 |       let _ = client
+   |  _____________-
+10 | |         .mark_reports_reimbursed(ReimburseTargets::report_ids(["R1"]))
+11 | |         .status("APPROVED");
+   | |         -^^^^^^ method not found in `ReimburseAction`
+   | |_________|
+   |

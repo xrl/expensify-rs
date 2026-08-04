@@ -1,0 +1,25 @@
+error: cannot construct `ExportedFile<_>` with struct literal syntax due to private fields
+  --> tests/ui/01_wrong_file_system.rs:8:27
+   |
+ 8 |     let _: ExportedFile = ExportedFile {
+   |                           ^^^^^^^^^^^^
+ 9 |         name: "is_reconciliation_5429137734434770049.csv".into(),
+   |         -------------------------------------------------------- private field
+10 |         file_system: FileSystem::IntegrationServer,
+   |         ------------------------------------------ private field
+   |
+   = note: ...and other private field `_out` that was not provided
+help: you might have meant to use an associated function to build this type
+   |
+ 8 -     let _: ExportedFile = ExportedFile {
+ 9 -         name: "is_reconciliation_5429137734434770049.csv".into(),
+10 -         file_system: FileSystem::IntegrationServer,
+11 -     };
+ 8 +     let _: ExportedFile = ExportedFile::from_response(_, _);
+   |
+ 8 -     let _: ExportedFile = ExportedFile {
+ 9 -         name: "is_reconciliation_5429137734434770049.csv".into(),
+10 -         file_system: FileSystem::IntegrationServer,
+11 -     };
+ 8 +     let _: ExportedFile = ExportedFile::from_parts(_, _);
+   |

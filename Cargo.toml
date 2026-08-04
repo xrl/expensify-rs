@@ -23,7 +23,10 @@ thiserror = "2"
 time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
 
 [dev-dependencies]
+serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+trybuild = "1"
+wiremock = "0.6"
 
 [features]
 default = []

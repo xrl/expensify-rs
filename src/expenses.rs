@@ -1,21 +1,27 @@
 use time::Date;
 
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::types::{Currency, Money, PolicyId, ReportId, TaxRateId, TransactionId};
-use crate::BoxFuture;
+use crate::wire;
 
 /// Tax applied to an expense. `rate_id` values come from the Policy
 /// Getter (`fields: ["tax"]`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpenseTax {
-    rate_id: TaxRateId,
-    amount_cents: Option<i64>,
+    pub(crate) rate_id: TaxRateId,
+    pub(crate) amount_cents: Option<i64>,
 }
 
 impl ExpenseTax {
+    /// Apply the policy's rate identified by `rate_id`; see
+    /// [`TaxRate::rate_id`](crate::TaxRate::rate_id).
     pub fn new(rate_id: impl Into<TaxRateId>) -> Self {
-        Self { rate_id: rate_id.into(), amount_cents: None }
+        Self {
+            rate_id: rate_id.into(),
+            amount_cents: None,
+        }
     }
 
     /// Explicit tax amount, for partially taxed expenses.
@@ -29,21 +35,22 @@ impl ExpenseTax {
 /// Required fields in the constructor, the rest fluent.
 #[derive(Clone, Debug)]
 pub struct Expense {
-    merchant: String,
-    date: Date,
-    amount: Money,
-    external_id: Option<String>,
-    category: Option<String>,
-    tag: Option<String>,
-    billable: Option<bool>,
-    reimbursable: Option<bool>,
-    comment: Option<String>,
-    report_id: Option<ReportId>,
-    policy_id: Option<PolicyId>,
-    tax: Option<ExpenseTax>,
+    pub(crate) merchant: String,
+    pub(crate) date: Date,
+    pub(crate) amount: Money,
+    pub(crate) external_id: Option<String>,
+    pub(crate) category: Option<String>,
+    pub(crate) tag: Option<String>,
+    pub(crate) billable: Option<bool>,
+    pub(crate) reimbursable: Option<bool>,
+    pub(crate) comment: Option<String>,
+    pub(crate) report_id: Option<ReportId>,
+    pub(crate) policy_id: Option<PolicyId>,
+    pub(crate) tax: Option<ExpenseTax>,
 }
 
 impl Expense {
+    /// The three fields Expensify always requires.
     pub fn new(merchant: impl Into<String>, date: Date, amount: Money) -> Self {
         Self {
             merchant: merchant.into(),
@@ -67,26 +74,31 @@ impl Expense {
         self
     }
 
+    /// Policy category name.
     pub fn category(mut self, category: impl Into<String>) -> Self {
         self.category = Some(category.into());
         self
     }
 
+    /// Policy tag name.
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         self.tag = Some(tag.into());
         self
     }
 
+    /// Mark billable to a client.
     pub fn billable(mut self, billable: bool) -> Self {
         self.billable = Some(billable);
         self
     }
 
+    /// Mark reimbursable to the employee.
     pub fn reimbursable(mut self, reimbursable: bool) -> Self {
         self.reimbursable = Some(reimbursable);
         self
     }
 
+    /// Free-text comment.
     pub fn comment(mut self, comment: impl Into<String>) -> Self {
         self.comment = Some(comment.into());
         self
@@ -104,6 +116,8 @@ impl Expense {
         self
     }
 
+    /// Attach tax; requires [`Expense::policy_id`] or an existing report to
+    /// resolve the rate.
     pub fn tax(mut self, tax: ExpenseTax) -> Self {
         self.tax = Some(tax);
         self
@@ -113,31 +127,44 @@ impl Expense {
 /// Expense Creator (`type: "create"`, `inputSettings.type: "expenses"`).
 #[must_use = "actions do nothing until awaited"]
 pub struct CreateExpensesAction {
-    client: Client,
-    expenses: Vec<Expense>,
-    employee_email: Option<String>,
+    pub(crate) client: Client,
+    pub(crate) expenses: Vec<Expense>,
+    pub(crate) employee_email: Option<String>,
 }
 
 impl CreateExpensesAction {
     pub(crate) fn new(client: Client, expenses: Vec<Expense>) -> Self {
-        Self { client, expenses, employee_email: None }
+        Self {
+            client,
+            expenses,
+            employee_email: None,
+        }
     }
 
-    /// Create in another user's account. Restricted: requires advanced
-    /// permissions granted by Expensify. Default: the credential owner's
+    /// Create in another user's account. Default: the credential owner's
     /// account.
+    ///
+    /// Restricted: Expensify must grant the credential advanced
+    /// permissions, otherwise the job fails with
+    /// [`ApiErrorKind::InvalidPermissions`](crate::ApiErrorKind::InvalidPermissions).
     pub fn employee_email(mut self, email: impl Into<String>) -> Self {
         self.employee_email = Some(email.into());
         self
     }
 }
 
+/// One created expense, as echoed back by Expensify.
 #[derive(Clone, Debug)]
 pub struct CreatedTransaction {
+    /// Assigned identifier.
     pub transaction_id: TransactionId,
+    /// Merchant as stored.
     pub merchant: String,
+    /// Expense date (`created` on the wire).
     pub created: Date,
+    /// Amount in integer cents.
     pub amount_cents: i64,
+    /// Currency of `amount_cents`.
     pub currency: Currency,
 }
 
@@ -147,8 +174,9 @@ impl IntoFuture for CreateExpensesAction {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let request = wire::create_expenses(&self);
+            let response = self.client.send(request).await?;
+            wire::created_transactions(response)
         })
     }
 }

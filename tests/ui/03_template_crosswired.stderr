@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/03_template_crosswired.rs:13:9
+   |
+12 |     let _ = client.domain("acme.com").reconcile(
+   |                                       --------- arguments to this method are incorrect
+13 |         &template,
+   |         ^^^^^^^^^ expected `&ReconciliationTemplate<_>`, found `&ExportTemplate`
+   |
+   = note: expected reference `&ReconciliationTemplate<_>`
+              found reference `&ExportTemplate`
+note: method defined here
+  --> src/client.rs
+   |
+   |     pub fn reconcile<F>(
+   |            ^^^^^^^^^

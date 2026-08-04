@@ -4,18 +4,21 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::template::FromExport;
-use crate::BoxFuture;
+use crate::wire;
 
 /// Which server-side store the Downloader reads from. Determined by the
 /// job that produced the file, never chosen by the caller on the normal
 /// path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileSystem {
+    /// Report Exporter output.
     #[serde(rename = "integrationServer")]
     IntegrationServer,
+    /// Reconciliation output.
     #[serde(rename = "reconciliation")]
     Reconciliation,
 }
@@ -37,13 +40,19 @@ pub struct ExportedFile<F = Bytes> {
 
 impl<F> ExportedFile<F> {
     pub(crate) fn from_response(name: String, file_system: FileSystem) -> Self {
-        Self { name, file_system, _out: PhantomData }
+        Self {
+            name,
+            file_system,
+            _out: PhantomData,
+        }
     }
 
+    /// Server-side filename, as returned by the producing job.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Which store [`Client::download`] will read from.
     pub fn file_system(&self) -> FileSystem {
         self.file_system
     }
@@ -63,7 +72,11 @@ impl ExportedFile<Bytes> {
     /// column). The caller asserts the file system; the library cannot
     /// verify it. Deliberately restricted to the untyped form.
     pub fn from_parts(name: impl Into<String>, file_system: FileSystem) -> Self {
-        Self { name: name.into(), file_system, _out: PhantomData }
+        Self {
+            name: name.into(),
+            file_system,
+            _out: PhantomData,
+        }
     }
 }
 
@@ -87,6 +100,11 @@ impl<F> fmt::Debug for ExportedFile<F> {
 }
 
 /// Downloader job (`type: "download"`). No options.
+///
+/// Report exports render asynchronously server-side and Expensify does not
+/// document a "not ready yet" signal, so downloading too early surfaces
+/// whatever the server sends back. Reconciliation output is synchronous and
+/// immediately available.
 #[must_use = "actions do nothing until awaited"]
 pub struct DownloadAction<F> {
     client: Client,
@@ -112,8 +130,50 @@ impl<F: FromExport> IntoFuture for DownloadAction<F> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let _ = self;
-            todo!()
+            let request = wire::download(&self.name, self.file_system);
+            let bytes = self.client.send_download(request).await?;
+            F::from_export(bytes).map_err(Into::into)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::template::Json;
+
+    #[test]
+    fn file_system_wire_names() {
+        assert_eq!(
+            serde_json::to_value(FileSystem::IntegrationServer).unwrap(),
+            "integrationServer"
+        );
+        assert_eq!(
+            serde_json::to_value(FileSystem::Reconciliation).unwrap(),
+            "reconciliation"
+        );
+    }
+
+    /// The persistence story: a round trip must keep the file system, and
+    /// `bound = ""` must keep `F` free of serde bounds.
+    #[test]
+    fn typed_handle_round_trips_without_bounds_on_f() {
+        let file: ExportedFile<Json<Vec<String>>> = ExportedFile::from_response(
+            "is_reconciliation_1.csv".into(),
+            FileSystem::Reconciliation,
+        );
+
+        let json = serde_json::to_string(&file).unwrap();
+        let back: ExportedFile<Json<Vec<String>>> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(back.name(), "is_reconciliation_1.csv");
+        assert_eq!(back.file_system(), FileSystem::Reconciliation);
+    }
+
+    #[test]
+    fn untyped_keeps_the_file_system() {
+        let file: ExportedFile<Json<Vec<String>>> =
+            ExportedFile::from_response("x.csv".into(), FileSystem::Reconciliation);
+        assert_eq!(file.untyped().file_system(), FileSystem::Reconciliation);
     }
 }

@@ -1,0 +1,1659 @@
+//! Private wire layer: envelope assembly and response parsing.
+//!
+//! Everything Expensify-shaped lives here — job type strings, the camelCase
+//! and `*ID` key spellings, the string-typed numbers, the response mirrors.
+//! There is no published spec and no changelog upstream, so this is the
+//! module expected to rot; keeping it in one file is deliberate.
+//!
+//! The load-bearing rule: **HTTP 200 does not imply success.** Every JSON
+//! response carries its own `responseCode` and that code wins over the status
+//! line. The Downloader is the exception, since a successful download body is
+//! raw file content rather than an envelope.
+
+use std::collections::HashMap;
+
+use bytes::Bytes;
+use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
+use time::format_description::BorrowedFormatItem;
+use time::macros::format_description;
+use time::{Date, PrimitiveDateTime};
+
+use crate::cards::DomainCard;
+use crate::client::Client;
+use crate::employees::{
+    Employee, EmployeeSource, EmployeeUpdateOutcome, PrimaryPolicyMode, SkippedEmployee,
+    UpdateEmployeesAction,
+};
+use crate::error::{ApiError, ApiErrorKind, DecodeError, Error};
+use crate::expense_rules::{CreateExpenseRuleAction, UpdateExpenseRuleAction};
+use crate::expenses::{CreateExpensesAction, CreatedTransaction, Expense};
+use crate::export::{
+    ExportFormat, ExportReportsAction, OnFinish, OnFinishKind, ReportState, ReportsQuery,
+    SftpConnection,
+};
+use crate::file::FileSystem;
+use crate::policy::{
+    CreatedPolicy, ListPoliciesAction, PolicyPlan, PolicySummary, SetTagApproversAction,
+    TagApprover, TagsSource, UpdateMode, UpdatePolicyAction,
+};
+use crate::reconciliation::{ReconcileAction, ReconciliationScope};
+use crate::reports::{
+    CreateReportAction, CreatedReport, ReimburseOutcome, ReimburseTargets, SkippedReport,
+};
+use crate::types::{Currency, PolicyId, ReportId, TransactionId};
+
+/// The form field carrying the JSON job description.
+const JOB_FIELD: &str = "requestJobDescription";
+
+const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
+const DATE_TIME_SPACE: &[BorrowedFormatItem<'_>] =
+    format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+const DATE_TIME_T: &[BorrowedFormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]");
+
+// ---------------------------------------------------------------------------
+// formatting helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn fmt_date(date: Date) -> String {
+    date.format(DATE)
+        .expect("yyyy-mm-dd is infallible for a valid Date")
+}
+
+fn parse_date(raw: &str) -> Option<Date> {
+    Date::parse(raw.get(..10)?, DATE).ok()
+}
+
+fn parse_date_time(raw: &str) -> Option<PrimitiveDateTime> {
+    PrimitiveDateTime::parse(raw, DATE_TIME_SPACE)
+        .or_else(|_| PrimitiveDateTime::parse(raw, DATE_TIME_T))
+        .ok()
+}
+
+fn join<T: AsRef<str>>(items: impl IntoIterator<Item = T>) -> String {
+    items
+        .into_iter()
+        .map(|i| i.as_ref().to_owned())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn report_state(state: ReportState) -> &'static str {
+    match state {
+        ReportState::Open => "OPEN",
+        ReportState::Submitted => "SUBMITTED",
+        ReportState::Approved => "APPROVED",
+        ReportState::Reimbursed => "REIMBURSED",
+        ReportState::Archived => "ARCHIVED",
+    }
+}
+
+fn export_format(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Csv => "csv",
+        ExportFormat::Xls => "xls",
+        ExportFormat::Xlsx => "xlsx",
+        ExportFormat::Txt => "txt",
+        ExportFormat::Pdf => "pdf",
+        ExportFormat::Json => "json",
+        ExportFormat::Xml => "xml",
+    }
+}
+
+fn file_system(fs: FileSystem) -> &'static str {
+    match fs {
+        FileSystem::IntegrationServer => "integrationServer",
+        FileSystem::Reconciliation => "reconciliation",
+    }
+}
+
+fn update_mode(mode: UpdateMode) -> &'static str {
+    match mode {
+        UpdateMode::Merge => "merge",
+        UpdateMode::ReplaceAll => "replace",
+    }
+}
+
+fn policy_plan(plan: PolicyPlan) -> &'static str {
+    match plan {
+        PolicyPlan::Team => "team",
+        PolicyPlan::Corporate => "corporate",
+    }
+}
+
+fn primary_policy(mode: PrimaryPolicyMode) -> &'static str {
+    match mode {
+        PrimaryPolicyMode::None => "none",
+        PrimaryPolicyMode::NewEmployees => "new_employees",
+        PrimaryPolicyMode::AllEmployees => "all_employees",
+    }
+}
+
+/// Expensify keys report fields by the label with every non-alphanumeric
+/// character replaced by `_`.
+pub(crate) fn normalize_report_field_key(key: &str) -> String {
+    key.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Insert `key` only when the option is populated; Expensify treats an
+/// explicit `null` as a value in several jobs.
+macro_rules! opt {
+    ($map:expr, $key:expr, $value:expr) => {
+        if let Some(value) = &$value {
+            $map.insert($key.to_owned(), json!(value));
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// request envelope
+// ---------------------------------------------------------------------------
+
+/// One outbound job: the `requestJobDescription` object plus whichever of
+/// the auxiliary form fields the job uses.
+pub(crate) struct JobRequest {
+    job: Map<String, Value>,
+    /// Merged into `credentials` alongside the partner ID/secret — the
+    /// employee updater's feed access lives there.
+    credential_extras: Map<String, Value>,
+    template: Option<String>,
+    file: Option<String>,
+    data: Option<String>,
+    #[cfg(feature = "employee-updater-deprecated")]
+    multipart_data: Option<Bytes>,
+}
+
+impl JobRequest {
+    fn new(job_type: &str) -> Self {
+        let mut job = Map::new();
+        job.insert("type".to_owned(), json!(job_type));
+        Self {
+            job,
+            credential_extras: Map::new(),
+            template: None,
+            file: None,
+            data: None,
+            #[cfg(feature = "employee-updater-deprecated")]
+            multipart_data: None,
+        }
+    }
+
+    fn set(mut self, key: &str, value: Value) -> Self {
+        self.job.insert(key.to_owned(), value);
+        self
+    }
+
+    fn input_settings(self, settings: Map<String, Value>) -> Self {
+        self.set("inputSettings", Value::Object(settings))
+    }
+
+    fn template(mut self, source: &str) -> Self {
+        self.template = Some(source.to_owned());
+        self
+    }
+
+    /// Tag CSV/TSV payloads ride in a urlencoded form field, so they must be
+    /// text; non-UTF-8 input is replaced rather than rejected.
+    fn file(mut self, data: &Bytes) -> Self {
+        self.file = Some(String::from_utf8_lossy(data).into_owned());
+        self
+    }
+
+    fn data(mut self, data: String) -> Self {
+        self.data = Some(data);
+        self
+    }
+
+    /// The job description as it will be sent, minus credentials. Exposed for
+    /// serialization-shape tests.
+    #[cfg(test)]
+    pub(crate) fn description(&self) -> &Map<String, Value> {
+        &self.job
+    }
+
+    #[cfg(test)]
+    pub(crate) fn input(&self) -> &Map<String, Value> {
+        self.job["inputSettings"]
+            .as_object()
+            .expect("inputSettings is an object")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn template_source(&self) -> Option<&str> {
+        self.template.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_field(&self) -> Option<&str> {
+        self.file.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_field(&self) -> Option<&str> {
+        self.data.as_deref()
+    }
+
+    fn finish(mut self, client: &Client) -> (Map<String, Value>, Vec<(&'static str, String)>) {
+        let mut credentials = self.credential_extras;
+        credentials.insert(
+            "partnerUserID".to_owned(),
+            json!(client.inner.credentials.partner_user_id),
+        );
+        credentials.insert(
+            "partnerUserSecret".to_owned(),
+            json!(client.inner.credentials.partner_user_secret),
+        );
+        self.job
+            .insert("credentials".to_owned(), Value::Object(credentials));
+
+        let mut fields: Vec<(&'static str, String)> = Vec::new();
+        if let Some(template) = self.template {
+            fields.push(("template", template));
+        }
+        if let Some(file) = self.file {
+            fields.push(("file", file));
+        }
+        if let Some(data) = self.data {
+            fields.push(("data", data));
+        }
+        (self.job, fields)
+    }
+}
+
+impl Client {
+    /// Submit a job and return the parsed success envelope.
+    pub(crate) async fn send(&self, request: JobRequest) -> Result<Value, Error> {
+        let (status, headers, body) = self.raw(request).await?;
+        parse_envelope(status, &headers, &body)
+    }
+
+    /// Submit a job whose success body is a file rather than an envelope.
+    pub(crate) async fn send_download(&self, request: JobRequest) -> Result<Bytes, Error> {
+        let (status, headers, body) = self.raw(request).await?;
+        parse_download(status, &headers, body)
+    }
+
+    async fn raw(&self, request: JobRequest) -> Result<(StatusCode, HeaderMap, Bytes), Error> {
+        if let Some(gate) = &self.inner.limiter {
+            gate.acquire().await;
+        }
+
+        #[cfg(feature = "employee-updater-deprecated")]
+        let multipart = request.multipart_data.clone();
+
+        let (job, fields) = request.finish(self);
+        let description = Value::Object(job).to_string();
+
+        let builder = self.inner.http.post(self.inner.base_url.clone());
+
+        #[cfg(feature = "employee-updater-deprecated")]
+        let builder = match multipart {
+            Some(csv) => {
+                let form = reqwest::multipart::Form::new()
+                    .text(JOB_FIELD, description.clone())
+                    .part(
+                        "data",
+                        reqwest::multipart::Part::stream(csv).file_name("employees.csv"),
+                    );
+                builder.multipart(form)
+            }
+            None => builder.form(&form_fields(&description, &fields)),
+        };
+        #[cfg(not(feature = "employee-updater-deprecated"))]
+        let builder = builder.form(&form_fields(&description, &fields));
+
+        let response = builder.send().await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await?;
+        Ok((status, headers, body))
+    }
+}
+
+fn form_fields<'a>(
+    description: &'a str,
+    extras: &'a [(&'static str, String)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut fields = vec![(JOB_FIELD, description)];
+    fields.extend(extras.iter().map(|(k, v)| (*k, v.as_str())));
+    fields
+}
+
+// ---------------------------------------------------------------------------
+// response envelope
+// ---------------------------------------------------------------------------
+
+fn response_code(map: &Map<String, Value>) -> Option<u16> {
+    match map.get("responseCode")? {
+        Value::Number(n) => n.as_u64()?.try_into().ok(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn response_message(map: &Map<String, Value>) -> Option<String> {
+    map.get("responseMessage")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn error_kind(code: u16) -> ApiErrorKind {
+    match code {
+        403 => ApiErrorKind::InvalidPermissions,
+        404 => ApiErrorKind::NotFound,
+        410 => ApiErrorKind::Validation,
+        500 => ApiErrorKind::Server,
+        _ => ApiErrorKind::Other,
+    }
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(std::time::Duration::from_secs)
+}
+
+fn api_error(code: u16, map: &Map<String, Value>, headers: &HeaderMap) -> Error {
+    if code == 429 {
+        return Error::RateLimited {
+            retry_after: retry_after(headers),
+        };
+    }
+    Error::Api(ApiError {
+        kind: error_kind(code),
+        code,
+        message: response_message(map),
+    })
+}
+
+/// Body `responseCode` first, HTTP status only as a fallback.
+fn parse_envelope(status: StatusCode, headers: &HeaderMap, body: &Bytes) -> Result<Value, Error> {
+    let parsed = serde_json::from_slice::<Value>(body);
+    if let Ok(Value::Object(map)) = &parsed {
+        if let Some(code) = response_code(map) {
+            return match code {
+                200 | 207 => Ok(parsed.expect("checked above")),
+                code => Err(api_error(code, map, headers)),
+            };
+        }
+    }
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::RateLimited {
+            retry_after: retry_after(headers),
+        });
+    }
+    if !status.is_success() {
+        return Err(Error::Http {
+            status,
+            body: String::from_utf8_lossy(body).into_owned(),
+        });
+    }
+    match parsed {
+        Err(err) => Err(DecodeError::Json(err).into()),
+        Ok(_) => Err(DecodeError::custom("response was not an Expensify envelope").into()),
+    }
+}
+
+/// A successful download body is the file itself. Only a non-200 JSON
+/// envelope or a non-success status counts as failure — a template that
+/// happens to emit `{"responseCode": 200, ...}` is treated as content.
+fn parse_download(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Result<Bytes, Error> {
+    if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&body) {
+        match response_code(&map) {
+            Some(200) | None => {}
+            Some(code) => return Err(api_error(code, &map, headers)),
+        }
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::RateLimited {
+            retry_after: retry_after(headers),
+        });
+    }
+    if !status.is_success() {
+        return Err(Error::Http {
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        });
+    }
+    Ok(body)
+}
+
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
+    serde_json::from_value(value).map_err(|err| DecodeError::Json(err).into())
+}
+
+fn missing(field: &str) -> Error {
+    DecodeError::custom(format!("response is missing `{field}`")).into()
+}
+
+fn take(value: &mut Value, field: &str) -> Option<Value> {
+    value.as_object_mut()?.remove(field)
+}
+
+fn take_required(value: &mut Value, field: &str) -> Result<Value, Error> {
+    take(value, field).ok_or_else(|| missing(field))
+}
+
+/// Both the exporter and reconciliation answer with the generated filename;
+/// the documented key is `filename`, but tolerate the camelCase spelling.
+pub(crate) fn filename(mut value: Value) -> Result<String, Error> {
+    let raw = take(&mut value, "filename")
+        .or_else(|| take(&mut value, "fileName"))
+        .ok_or_else(|| missing("filename"))?;
+    decode(raw)
+}
+
+// ---------------------------------------------------------------------------
+// exports
+// ---------------------------------------------------------------------------
+
+fn filters(query: &ReportsQuery) -> Map<String, Value> {
+    let mut filters = Map::new();
+    if !query.report_ids.is_empty() {
+        filters.insert(
+            "reportIDList".to_owned(),
+            json!(join(query.report_ids.iter().map(ReportId::as_str))),
+        );
+    }
+    if !query.policy_ids.is_empty() {
+        filters.insert(
+            "policyIDList".to_owned(),
+            json!(join(query.policy_ids.iter().map(PolicyId::as_str))),
+        );
+    }
+    if let Some(start) = query.start_date {
+        filters.insert("startDate".to_owned(), json!(fmt_date(start)));
+    }
+    if let Some(end) = query.end_date {
+        filters.insert("endDate".to_owned(), json!(fmt_date(end)));
+    }
+    if let Some(approved) = query.approved_after {
+        filters.insert("approvedAfter".to_owned(), json!(fmt_date(approved)));
+    }
+    opt!(filters, "markedAsExported", query.marked_as_exported);
+    filters
+}
+
+fn sftp_data(connection: &SftpConnection) -> Value {
+    json!({
+        "host": connection.host,
+        "login": connection.login,
+        "password": connection.password,
+        "port": connection.port,
+    })
+}
+
+fn on_finish(action: &OnFinish) -> Value {
+    match &action.kind {
+        OnFinishKind::MarkAsExported { label } => {
+            json!({ "actionName": "markAsExported", "label": label })
+        }
+        OnFinishKind::Email {
+            recipients,
+            message,
+        } => {
+            let mut map = Map::new();
+            map.insert("actionName".to_owned(), json!("email"));
+            map.insert("recipients".to_owned(), json!(recipients));
+            opt!(map, "message", message);
+            Value::Object(map)
+        }
+        OnFinishKind::SftpUpload(connection) => json!({
+            "actionName": "sftpUpload",
+            "sftpData": sftp_data(connection),
+        }),
+    }
+}
+
+pub(crate) fn export_reports<F>(action: &ExportReportsAction<F>) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("combinedReportData"));
+    if !action.states.is_empty() {
+        input.insert(
+            "reportState".to_owned(),
+            json!(join(action.states.iter().copied().map(report_state))),
+        );
+    }
+    // `limit` is a string on the wire even though it is numeric.
+    if let Some(limit) = action.limit {
+        input.insert("limit".to_owned(), json!(limit.to_string()));
+    }
+    opt!(input, "employeeEmail", action.employee_email);
+    input.insert("filters".to_owned(), Value::Object(filters(&action.query)));
+
+    let mut output = Map::new();
+    output.insert(
+        "fileExtension".to_owned(),
+        json!(export_format(action.format.unwrap_or(ExportFormat::Csv))),
+    );
+    opt!(output, "fileBasename", action.file_basename);
+    if action.include_full_page_receipts_pdf {
+        output.insert("includeFullPageReceiptsPdf".to_owned(), json!(true));
+    }
+
+    let mut request = JobRequest::new("file")
+        .set(
+            "onReceive",
+            json!({ "immediateResponse": ["returnRandomFileName"] }),
+        )
+        .input_settings(input)
+        .set("outputSettings", Value::Object(output))
+        .template(&action.template);
+
+    if !action.on_finish.is_empty() {
+        request = request.set(
+            "onFinish",
+            Value::Array(action.on_finish.iter().map(on_finish).collect()),
+        );
+    }
+    if action.test {
+        request = request.set("test", json!(true));
+    }
+    request
+}
+
+pub(crate) fn download(name: &str, fs: FileSystem) -> JobRequest {
+    JobRequest::new("download")
+        .set("fileName", json!(name))
+        .set("fileSystem", json!(file_system(fs)))
+}
+
+pub(crate) fn reconcile<F>(action: &ReconcileAction<F>) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("startDate".to_owned(), json!(fmt_date(action.start)));
+    input.insert("endDate".to_owned(), json!(fmt_date(action.end)));
+    input.insert("domain".to_owned(), json!(action.domain));
+    input.insert(
+        "type".to_owned(),
+        json!(match action.scope {
+            ReconciliationScope::Unreported => "Unreported",
+            ReconciliationScope::All => "All",
+        }),
+    );
+    // Only the synchronous mode works upstream, so it is not a parameter.
+    input.insert("async".to_owned(), json!(false));
+    input.insert(
+        "feed".to_owned(),
+        json!(action.feed.as_deref().unwrap_or("export_all_feeds")),
+    );
+
+    let mut request = JobRequest::new("reconciliation")
+        .input_settings(input)
+        .set(
+            "outputSettings",
+            json!({ "fileExtension": export_format(action.format.unwrap_or(ExportFormat::Csv)) }),
+        )
+        .template(&action.template);
+
+    if let Some(recipients) = &action.email_on_finish {
+        request = request.set(
+            "onFinish",
+            json!([{ "actionName": "email", "recipients": recipients }]),
+        );
+    }
+    request
+}
+
+// ---------------------------------------------------------------------------
+// policies
+// ---------------------------------------------------------------------------
+
+pub(crate) fn list_policies(action: &ListPoliciesAction) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("policyList"));
+    if action.admin_only {
+        input.insert("adminOnly".to_owned(), json!(true));
+    }
+    opt!(input, "userEmail", action.user_email);
+    JobRequest::new("get").input_settings(input)
+}
+
+#[derive(Deserialize)]
+struct PolicyListResponse {
+    #[serde(rename = "policyList", default)]
+    policies: Vec<PolicySummary>,
+}
+
+pub(crate) fn policy_list(value: Value) -> Result<Vec<PolicySummary>, Error> {
+    Ok(decode::<PolicyListResponse>(value)?.policies)
+}
+
+pub(crate) fn get_policies(
+    ids: &[PolicyId],
+    fields: &[&'static str],
+    user_email: Option<&str>,
+) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("policy"));
+    input.insert("fields".to_owned(), json!(fields));
+    input.insert("policyIDList".to_owned(), json!(ids));
+    opt!(input, "userEmail", user_email);
+    JobRequest::new("get").input_settings(input)
+}
+
+pub(crate) fn policy_info(mut value: Value) -> Result<HashMap<PolicyId, Value>, Error> {
+    let raw = take_required(&mut value, "policyInfo")?;
+    decode(raw)
+}
+
+/// The getter answers `"tax": {}` for a policy with no tax configuration.
+/// Rewriting that to `null` is what lets the public field stay a plain
+/// `Option<TaxConfig>`.
+pub(crate) fn normalize_tax(value: Value) -> Value {
+    match value {
+        Value::Object(map) if map.is_empty() => Value::Null,
+        other => other,
+    }
+}
+
+pub(crate) fn create_policy(name: &str, plan: Option<PolicyPlan>) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("policy"));
+    input.insert("policyName".to_owned(), json!(name));
+    if let Some(plan) = plan {
+        input.insert("plan".to_owned(), json!(policy_plan(plan)));
+    }
+    JobRequest::new("create").input_settings(input)
+}
+
+#[derive(Deserialize)]
+struct CreatePolicyResponse {
+    #[serde(rename = "policyID")]
+    policy_id: PolicyId,
+    #[serde(rename = "policyName")]
+    policy_name: String,
+}
+
+pub(crate) fn created_policy(value: Value) -> Result<CreatedPolicy, Error> {
+    let wire: CreatePolicyResponse = decode(value)?;
+    Ok(CreatedPolicy {
+        policy_id: wire.policy_id,
+        name: wire.policy_name,
+    })
+}
+
+pub(crate) fn update_policy(action: &UpdatePolicyAction) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("policy"));
+    if let [only] = action.policy_ids.as_slice() {
+        input.insert("policyID".to_owned(), json!(only));
+    } else {
+        input.insert("policyIDList".to_owned(), json!(action.policy_ids));
+    }
+
+    let mut request = JobRequest::new("update").input_settings(input);
+
+    if let Some(update) = &action.categories {
+        request = request.set(
+            "categories",
+            json!({ "action": update_mode(update.mode), "data": update.data }),
+        );
+    }
+    if let Some(update) = &action.report_fields {
+        request = request.set(
+            "reportFields",
+            json!({ "action": update_mode(update.mode), "data": update.data }),
+        );
+    }
+    if let Some(update) = &action.tags {
+        let mut tags = Map::new();
+        tags.insert("action".to_owned(), json!(update_mode(update.mode)));
+        match &update.source {
+            TagsSource::Inline(levels) => {
+                tags.insert("source".to_owned(), json!("inline"));
+                tags.insert(
+                    "data".to_owned(),
+                    Value::Array(
+                        levels
+                            .iter()
+                            .map(|level| {
+                                let mut map = Map::new();
+                                opt!(map, "name", level.name);
+                                map.insert("setRequired".to_owned(), json!(level.required));
+                                map.insert("tags".to_owned(), json!(level.tags));
+                                Value::Object(map)
+                            })
+                            .collect(),
+                    ),
+                );
+            }
+            TagsSource::Csv { data, config } => {
+                tags.insert("source".to_owned(), json!("file"));
+                tags.insert(
+                    "config".to_owned(),
+                    json!({
+                        "dependency": config.dependent,
+                        // Scalar for dependent levels, per-level array otherwise.
+                        "setRequired": if config.dependent {
+                            json!(config.set_required.first().copied().unwrap_or(false))
+                        } else {
+                            json!(config.set_required)
+                        },
+                        "glCodes": config.gl_codes,
+                        "header": config.header_row,
+                        // Upstream docs say "cvs"; the working value is "csv".
+                        "fileType": if config.tsv { "tsv" } else { "csv" },
+                    }),
+                );
+                request = request.file(data);
+            }
+        }
+        request = request.set("tags", Value::Object(tags));
+    }
+    request
+}
+
+pub(crate) fn set_tag_approvers(action: &SetTagApproversAction) -> JobRequest {
+    JobRequest::new("update")
+        .input_settings({
+            let mut input = Map::new();
+            input.insert("type".to_owned(), json!("tagApprovers"));
+            input.insert("policyID".to_owned(), json!(action.policy_id));
+            input
+        })
+        .set(
+            "tagApprovers",
+            Value::Array(
+                action
+                    .approvers
+                    .iter()
+                    .map(|approver: &TagApprover| {
+                        // `""` is Expensify's "unassign" sentinel.
+                        json!({
+                            "name": approver.name,
+                            "approver": approver.approver.as_deref().unwrap_or(""),
+                        })
+                    })
+                    .collect(),
+            ),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// reports & expenses
+// ---------------------------------------------------------------------------
+
+pub(crate) fn create_report(action: &CreateReportAction) -> JobRequest {
+    let mut report = Map::new();
+    report.insert("title".to_owned(), json!(action.title));
+    if !action.fields.is_empty() {
+        report.insert(
+            "fields".to_owned(),
+            Value::Object(
+                action
+                    .fields
+                    .iter()
+                    .map(|(key, value)| (normalize_report_field_key(key), value.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("report"));
+    input.insert("policyID".to_owned(), json!(action.policy_id));
+    input.insert("employeeEmail".to_owned(), json!(action.employee_email));
+    input.insert("report".to_owned(), Value::Object(report));
+    input.insert(
+        "expenses".to_owned(),
+        Value::Array(
+            action
+                .expenses
+                .iter()
+                .map(|line| {
+                    // The report creator spells the date `date`; the expense
+                    // creator spells the same thing `created`.
+                    json!({
+                        "date": fmt_date(line.date),
+                        "merchant": line.merchant,
+                        "amount": line.amount.cents,
+                        "currency": line.amount.currency,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    JobRequest::new("create").input_settings(input)
+}
+
+#[derive(Deserialize)]
+struct CreateReportResponse {
+    #[serde(rename = "reportID")]
+    report_id: ReportId,
+    #[serde(rename = "reportName")]
+    report_name: String,
+}
+
+pub(crate) fn created_report(value: Value) -> Result<CreatedReport, Error> {
+    let wire: CreateReportResponse = decode(value)?;
+    Ok(CreatedReport {
+        report_id: wire.report_id,
+        name: wire.report_name,
+    })
+}
+
+fn transaction(expense: &Expense) -> Value {
+    let mut map = Map::new();
+    map.insert("merchant".to_owned(), json!(expense.merchant));
+    map.insert("created".to_owned(), json!(fmt_date(expense.date)));
+    map.insert("amount".to_owned(), json!(expense.amount.cents));
+    map.insert("currency".to_owned(), json!(expense.amount.currency));
+    opt!(map, "externalID", expense.external_id);
+    opt!(map, "category", expense.category);
+    opt!(map, "tag", expense.tag);
+    opt!(map, "billable", expense.billable);
+    opt!(map, "reimbursable", expense.reimbursable);
+    opt!(map, "comment", expense.comment);
+    opt!(map, "reportID", expense.report_id);
+    opt!(map, "policyID", expense.policy_id);
+    if let Some(tax) = &expense.tax {
+        let mut tax_map = Map::new();
+        tax_map.insert("rateID".to_owned(), json!(tax.rate_id));
+        opt!(tax_map, "amount", tax.amount_cents);
+        map.insert("tax".to_owned(), Value::Object(tax_map));
+    }
+    Value::Object(map)
+}
+
+pub(crate) fn create_expenses(action: &CreateExpensesAction) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("expenses"));
+    opt!(input, "employeeEmail", action.employee_email);
+    input.insert(
+        "transactionList".to_owned(),
+        Value::Array(action.expenses.iter().map(transaction).collect()),
+    );
+    JobRequest::new("create").input_settings(input)
+}
+
+#[derive(Deserialize)]
+struct TransactionListResponse {
+    #[serde(rename = "transactionList", default)]
+    transactions: Vec<TransactionWire>,
+}
+
+#[derive(Deserialize)]
+struct TransactionWire {
+    #[serde(rename = "transactionID")]
+    transaction_id: TransactionId,
+    merchant: String,
+    created: String,
+    amount: i64,
+    currency: Currency,
+}
+
+pub(crate) fn created_transactions(value: Value) -> Result<Vec<CreatedTransaction>, Error> {
+    decode::<TransactionListResponse>(value)?
+        .transactions
+        .into_iter()
+        .map(|wire| {
+            Ok(CreatedTransaction {
+                transaction_id: wire.transaction_id,
+                merchant: wire.merchant,
+                created: parse_date(&wire.created).ok_or_else(|| {
+                    Error::from(DecodeError::custom(format!(
+                        "unparseable transaction date `{}`",
+                        wire.created
+                    )))
+                })?,
+                amount_cents: wire.amount,
+                currency: wire.currency,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn reimburse(targets: &ReimburseTargets, payment_source: Option<&str>) -> JobRequest {
+    let mut filters = Map::new();
+    if !targets.report_ids.is_empty() {
+        filters.insert(
+            "reportIDList".to_owned(),
+            json!(join(targets.report_ids.iter().map(ReportId::as_str))),
+        );
+    }
+    if let Some(start) = targets.start_date {
+        filters.insert("startDate".to_owned(), json!(fmt_date(start)));
+    }
+    if let Some(end) = targets.end_date {
+        filters.insert("endDate".to_owned(), json!(fmt_date(end)));
+    }
+
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("reportStatus"));
+    // REIMBURSED is the only value Expensify accepts.
+    input.insert("status".to_owned(), json!("REIMBURSED"));
+    opt!(input, "paymentSource", payment_source);
+    input.insert("filters".to_owned(), Value::Object(filters));
+    JobRequest::new("update").input_settings(input)
+}
+
+#[derive(Deserialize)]
+struct ReimburseResponse {
+    #[serde(rename = "reportIDs", default)]
+    updated: Vec<ReportId>,
+    #[serde(rename = "skippedReports", default)]
+    skipped: Vec<SkippedReportWire>,
+    #[serde(rename = "failedReports", default)]
+    failed: Vec<SkippedReportWire>,
+}
+
+#[derive(Deserialize)]
+struct SkippedReportWire {
+    #[serde(rename = "reportID")]
+    report_id: ReportId,
+    #[serde(default)]
+    reason: String,
+}
+
+impl From<SkippedReportWire> for SkippedReport {
+    fn from(wire: SkippedReportWire) -> Self {
+        Self {
+            report_id: wire.report_id,
+            reason: wire.reason,
+        }
+    }
+}
+
+pub(crate) fn reimburse_outcome(value: Value) -> Result<ReimburseOutcome, Error> {
+    let wire: ReimburseResponse = decode(value)?;
+    Ok(ReimburseOutcome {
+        updated: wire.updated,
+        skipped: wire.skipped.into_iter().map(Into::into).collect(),
+        failed: wire.failed.into_iter().map(Into::into).collect(),
+    })
+}
+
+/// 207 is the documented partial-success code; it is what splits the strict
+/// and tolerant reimbursement paths.
+pub(crate) fn is_partial(value: &Value) -> bool {
+    value
+        .as_object()
+        .and_then(response_code)
+        .is_some_and(|code| code == 207)
+}
+
+// ---------------------------------------------------------------------------
+// expense rules
+// ---------------------------------------------------------------------------
+
+fn rule_actions(tag: Option<&String>, default_billable: Option<bool>) -> Value {
+    let mut actions = Map::new();
+    opt!(actions, "tag", tag);
+    opt!(actions, "defaultBillable", default_billable);
+    Value::Object(actions)
+}
+
+pub(crate) fn create_expense_rule(action: &CreateExpenseRuleAction) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("expenseRules"));
+    input.insert("policyID".to_owned(), json!(action.policy_id));
+    input.insert("employeeEmail".to_owned(), json!(action.employee_email));
+    input.insert(
+        "actions".to_owned(),
+        rule_actions(action.tag.as_ref(), action.default_billable),
+    );
+    JobRequest::new("create").input_settings(input)
+}
+
+pub(crate) fn update_expense_rule(action: &UpdateExpenseRuleAction) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("expenseRules"));
+    input.insert("policyID".to_owned(), json!(action.policy_id));
+    input.insert("employeeEmail".to_owned(), json!(action.employee_email));
+    input.insert("ruleID".to_owned(), json!(action.rule_id));
+    input.insert(
+        "actions".to_owned(),
+        rule_actions(action.tag.as_ref(), action.default_billable),
+    );
+    JobRequest::new("update").input_settings(input)
+}
+
+// ---------------------------------------------------------------------------
+// employees
+// ---------------------------------------------------------------------------
+
+fn employee(employee: &Employee) -> Value {
+    let mut map = Map::new();
+    map.insert("employeeEmail".to_owned(), json!(employee.employee_email));
+    map.insert("managerEmail".to_owned(), json!(employee.manager_email));
+    map.insert("employeeID".to_owned(), json!(employee.employee_id));
+    map.insert("policyID".to_owned(), json!(employee.policy_id));
+    opt!(map, "firstName", employee.first_name);
+    opt!(map, "lastName", employee.last_name);
+    opt!(map, "customField1", employee.custom_field_1);
+    opt!(map, "customField2", employee.custom_field_2);
+    opt!(map, "approvalLimit", employee.approval_limit);
+    opt!(map, "overLimitApprover", employee.over_limit_approver);
+    opt!(map, "workerStatus", employee.worker_status);
+    opt!(map, "isTerminated", employee.is_terminated);
+    opt!(map, "domainGroupID", employee.domain_group_id);
+    opt!(map, "approvesTo", employee.approves_to);
+    opt!(map, "role", employee.role);
+    if !employee.additional_policy_ids.is_empty() {
+        map.insert(
+            "additionalPolicyIDs".to_owned(),
+            json!(employee.additional_policy_ids),
+        );
+    }
+    if employee.remove_from_unassigned_policies {
+        map.insert("shouldRemoveFromUnassignedPolicies".to_owned(), json!(true));
+    }
+    if !employee.default_tags.is_empty() {
+        map.insert("defaultTags".to_owned(), json!(employee.default_tags));
+    }
+    Value::Object(map)
+}
+
+pub(crate) fn update_employees(action: &UpdateEmployeesAction) -> JobRequest {
+    let mut request = JobRequest::new("update")
+        .input_settings({
+            let mut input = Map::new();
+            input.insert("type".to_owned(), json!("employees"));
+            input.insert("entity".to_owned(), json!("generic"));
+            input
+        })
+        // Hyphenated on the wire; the only such key in the API.
+        .set("dry-run", json!(action.dry_run))
+        .set("shouldFixApprovalChains", json!(action.fix_approval_chains));
+
+    if let Some(mode) = action.primary_policy {
+        request = request.set("setEmployeePrimaryPolicy", json!(primary_policy(mode)));
+    }
+    if action.first_level_managers_only {
+        request = request.set("fixFirstLevelManagersOnly", json!(true));
+    }
+    if action.skip_notification_emails {
+        request = request.set("shouldSkipNotificationEmail", json!(true));
+    }
+    if let Some(recipients) = &action.email_on_finish {
+        request = request.set(
+            "onFinish",
+            json!([{ "actionName": "email", "recipients": recipients }]),
+        );
+    }
+
+    match &action.source {
+        EmployeeSource::Inline(employees) => {
+            let feed = Value::Array(employees.iter().map(employee).collect());
+            request = request
+                .set("dataSource", json!("request"))
+                .data(feed.to_string());
+        }
+        EmployeeSource::FetchUrl {
+            url,
+            user,
+            password,
+        } => {
+            request = request.set("dataSource", json!("download"));
+            request
+                .credential_extras
+                .insert("feedUrl".to_owned(), json!(url));
+            opt!(request.credential_extras, "feedUser", user);
+            opt!(request.credential_extras, "feedPassword", password);
+        }
+        EmployeeSource::Sftp {
+            connection,
+            filename,
+        } => {
+            request = request.set("dataSource", json!("sftp"));
+            let mut sftp = sftp_data(connection);
+            if let Some(map) = sftp.as_object_mut() {
+                map.insert("filename".to_owned(), json!(filename));
+            }
+            request.credential_extras.insert("sftp".to_owned(), sftp);
+        }
+    }
+    request
+}
+
+#[derive(Deserialize)]
+struct EmployeeUpdateResponse {
+    #[serde(rename = "dry-run", default)]
+    dry_run: bool,
+    #[serde(rename = "updatedEmployeesCount", default)]
+    updated_count: u64,
+    #[serde(default)]
+    diff: EmployeeDiff,
+    #[serde(rename = "securityGroupEmployeesMap", default)]
+    security_groups: HashMap<String, Vec<String>>,
+    #[serde(rename = "skippedEmployees", default)]
+    skipped: Vec<SkippedEmployeeWire>,
+}
+
+#[derive(Default, Deserialize)]
+struct EmployeeDiff {
+    #[serde(rename = "diffToAdd", default)]
+    add: HashMap<PolicyId, Vec<String>>,
+    #[serde(rename = "diffToRemove", default)]
+    remove: HashMap<PolicyId, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct SkippedEmployeeWire {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    reason: String,
+}
+
+pub(crate) fn employee_outcome(value: Value) -> Result<EmployeeUpdateOutcome, Error> {
+    let wire: EmployeeUpdateResponse = decode(value)?;
+    Ok(EmployeeUpdateOutcome {
+        dry_run: wire.dry_run,
+        updated_count: wire.updated_count,
+        added: wire.diff.add,
+        removed: wire.diff.remove,
+        security_group_assignments: wire.security_groups,
+        skipped: wire
+            .skipped
+            .into_iter()
+            .map(|s| SkippedEmployee {
+                email: s.email,
+                reason: s.reason,
+            })
+            .collect(),
+    })
+}
+
+#[cfg(feature = "employee-updater-deprecated")]
+pub(crate) fn update_employees_csv(policy_id: &PolicyId, csv: Bytes) -> JobRequest {
+    let mut request = JobRequest::new("update").input_settings({
+        let mut input = Map::new();
+        input.insert("type".to_owned(), json!("employees"));
+        input.insert("policyID".to_owned(), json!(policy_id));
+        input
+    });
+    request.multipart_data = Some(csv);
+    request
+}
+
+#[cfg(feature = "employee-updater-deprecated")]
+pub(crate) fn nb_employees(mut value: Value) -> Result<u64, Error> {
+    decode(take_required(&mut value, "nbEmployees")?)
+}
+
+// ---------------------------------------------------------------------------
+// domain cards
+// ---------------------------------------------------------------------------
+
+pub(crate) fn card_list(domain: &str) -> JobRequest {
+    let mut input = Map::new();
+    input.insert("type".to_owned(), json!("domainCardList"));
+    input.insert("domain".to_owned(), json!(domain));
+    JobRequest::new("get").input_settings(input)
+}
+
+#[derive(Deserialize)]
+struct DomainCardListResponse {
+    #[serde(rename = "domainCardList", default)]
+    cards: Vec<DomainCardWire>,
+}
+
+#[derive(Deserialize)]
+struct DomainCardWire {
+    #[serde(default)]
+    bank: String,
+    #[serde(rename = "cardID", default)]
+    card_id: i64,
+    #[serde(rename = "cardName", default)]
+    card_name: String,
+    #[serde(rename = "cardNumber", default)]
+    card_number: String,
+    #[serde(default)]
+    email: String,
+    #[serde(rename = "externalEmployeeID", default)]
+    external_employee_id: Option<String>,
+    #[serde(default)]
+    created: Option<String>,
+    #[serde(rename = "lastImport", default)]
+    last_import: Option<String>,
+    #[serde(rename = "lastImportResult", default)]
+    last_import_result: Option<u16>,
+    #[serde(default)]
+    reimbursable: bool,
+    #[serde(rename = "scrapeMinDate", default)]
+    scrape_min_date: Option<String>,
+}
+
+/// Expensify uses `""` rather than `null` for absent card timestamps.
+fn blank_to_none(raw: Option<String>) -> Option<String> {
+    raw.filter(|s| !s.trim().is_empty())
+}
+
+pub(crate) fn domain_cards(value: Value) -> Result<Vec<DomainCard>, Error> {
+    Ok(decode::<DomainCardListResponse>(value)?
+        .cards
+        .into_iter()
+        .map(|wire| DomainCard {
+            bank: wire.bank,
+            card_id: wire.card_id,
+            card_name: wire.card_name,
+            card_number: wire.card_number,
+            email: wire.email,
+            external_employee_id: blank_to_none(wire.external_employee_id),
+            created: blank_to_none(wire.created)
+                .as_deref()
+                .and_then(parse_date_time),
+            last_import: blank_to_none(wire.last_import)
+                .as_deref()
+                .and_then(parse_date_time),
+            last_import_result: wire.last_import_result,
+            reimbursable: wire.reimbursable,
+            scrape_min_date: blank_to_none(wire.scrape_min_date)
+                .as_deref()
+                .and_then(parse_date),
+        })
+        .collect())
+}
+
+#[cfg(test)]
+// `129_00` reads as dollars-and-cents, which is the point.
+#[allow(clippy::inconsistent_digit_grouping)]
+mod tests {
+    use super::*;
+    use crate::expenses::ExpenseTax;
+    use crate::policy::{
+        Category, PolicyTag, ReportFieldDef, ReportFieldType, ReportFieldValue, TagCsvConfig,
+        TagLevel, TagsUpdate,
+    };
+    use crate::reports::ExpenseLine;
+    use crate::types::Money;
+    use time::macros::date;
+
+    fn envelope(code: u16) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"responseCode":{code},"responseMessage":"nope"}}"#
+        ))
+    }
+
+    #[test]
+    fn body_code_beats_http_200() {
+        let err = parse_envelope(StatusCode::OK, &HeaderMap::new(), &envelope(410)).unwrap_err();
+        match err {
+            Error::Api(api) => {
+                assert_eq!(api.code, 410);
+                assert_eq!(api.kind, ApiErrorKind::Validation);
+                assert_eq!(api.message.as_deref(), Some("nope"));
+            }
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_code_429_is_rate_limited() {
+        let err = parse_envelope(StatusCode::OK, &HeaderMap::new(), &envelope(429)).unwrap_err();
+        assert!(matches!(err, Error::RateLimited { retry_after: None }));
+    }
+
+    #[test]
+    fn http_429_without_envelope_is_rate_limited() {
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        let err = parse_envelope(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            &Bytes::from_static(b"slow down"),
+        )
+        .unwrap_err();
+        match err {
+            Error::RateLimited { retry_after } => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(30)));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_success_http_without_envelope_is_http_error() {
+        let err = parse_envelope(
+            StatusCode::BAD_GATEWAY,
+            &HeaderMap::new(),
+            &Bytes::from_static(b"<html>nginx</html>"),
+        )
+        .unwrap_err();
+        match err {
+            Error::Http { status, body } => {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+                assert!(body.contains("nginx"));
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_body_is_content_not_envelope() {
+        let body = Bytes::from_static(b"a,b,c\n1,2,3\n");
+        let out = parse_download(StatusCode::OK, &HeaderMap::new(), body.clone()).unwrap();
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn download_json_error_envelope_is_failure() {
+        let err = parse_download(StatusCode::OK, &HeaderMap::new(), envelope(404)).unwrap_err();
+        match err {
+            Error::Api(api) => assert_eq!(api.kind, ApiErrorKind::NotFound),
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_json_content_survives() {
+        // A template emitting JSON must not be mistaken for an envelope.
+        let body = Bytes::from_static(br#"[{"report_id":"R1"}]"#);
+        let out = parse_download(StatusCode::OK, &HeaderMap::new(), body.clone()).unwrap();
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn export_serialization_shape() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let template: crate::ExportTemplate<crate::Json<Vec<u8>>> =
+            crate::ExportTemplate::typed("<#list reports as r></#list>");
+        let action = client
+            .export_reports(
+                &template,
+                ReportsQuery::since(date!(2026 - 07 - 01))
+                    .until(date!(2026 - 08 - 01))
+                    .policy_ids(["P1", "P2"])
+                    .not_yet_exported_as("acme-etl"),
+            )
+            .state(ReportState::Approved)
+            .state(ReportState::Reimbursed)
+            .limit(50)
+            .format(ExportFormat::Json)
+            .file_basename("close")
+            .mark_as_exported("acme-etl")
+            .test_run();
+
+        let request = export_reports(&action);
+        let input = request.input();
+
+        assert_eq!(input["type"], "combinedReportData");
+        assert_eq!(input["reportState"], "APPROVED,REIMBURSED");
+        // A string, not a number.
+        assert_eq!(input["limit"], json!("50"));
+        assert_eq!(input["filters"]["policyIDList"], "P1,P2");
+        assert_eq!(input["filters"]["startDate"], "2026-07-01");
+        assert_eq!(input["filters"]["endDate"], "2026-08-01");
+        assert_eq!(input["filters"]["markedAsExported"], "acme-etl");
+
+        let job = request.description();
+        assert_eq!(job["type"], "file");
+        assert_eq!(
+            job["onReceive"]["immediateResponse"][0],
+            "returnRandomFileName"
+        );
+        assert_eq!(job["outputSettings"]["fileExtension"], "json");
+        assert_eq!(job["outputSettings"]["fileBasename"], "close");
+        assert_eq!(job["onFinish"][0]["actionName"], "markAsExported");
+        assert_eq!(job["onFinish"][0]["label"], "acme-etl");
+        assert_eq!(job["test"], json!(true));
+        assert!(request.template_source().unwrap().contains("#list reports"));
+        assert!(
+            !job.contains_key("credentials"),
+            "credentials added at send"
+        );
+    }
+
+    #[test]
+    fn export_defaults_to_csv_even_for_json_templates() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let template: crate::ExportTemplate<crate::Json<Vec<u8>>> =
+            crate::ExportTemplate::typed("x");
+        let action = client.export_reports(&template, ReportsQuery::report_ids(["R1"]));
+        let request = export_reports(&action);
+        assert_eq!(
+            request.description()["outputSettings"]["fileExtension"],
+            "csv"
+        );
+    }
+
+    #[test]
+    fn download_names_the_file_system() {
+        let request = download("is_reconciliation_1.csv", FileSystem::Reconciliation);
+        let job = request.description();
+        assert_eq!(job["type"], "download");
+        assert_eq!(job["fileName"], "is_reconciliation_1.csv");
+        assert_eq!(job["fileSystem"], "reconciliation");
+    }
+
+    #[test]
+    fn expense_uses_integer_cents_and_created() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client.create_expenses([Expense::new(
+            "Cloud Inc",
+            date!(2026 - 07 - 31),
+            Money::new(129_00, "USD"),
+        )
+        .category("Infrastructure")
+        .external_id("hosting-2026-07")
+        .tax(ExpenseTax::new("id_TAX_OPTION_16").amount_cents(600))]);
+        let request = create_expenses(&action);
+        let txn = &request.input()["transactionList"][0];
+        assert_eq!(txn["amount"], json!(12900));
+        assert_eq!(txn["currency"], "USD");
+        assert_eq!(txn["created"], "2026-07-31");
+        assert_eq!(txn["externalID"], "hosting-2026-07");
+        assert_eq!(txn["tax"]["rateID"], "id_TAX_OPTION_16");
+        assert_eq!(txn["tax"]["amount"], json!(600));
+        assert!(txn.get("comment").is_none(), "unset options are absent");
+    }
+
+    #[test]
+    fn report_creator_normalizes_field_keys_and_uses_date() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client
+            .create_report(
+                "P1",
+                "user@example.com",
+                "July",
+                [ExpenseLine::new(
+                    "Taxi",
+                    date!(2026 - 07 - 04),
+                    Money::new(2_50, "USD"),
+                )],
+            )
+            .report_field("Reason of trip!", "Business trip");
+        let request = create_report(&action);
+        let input = request.input();
+        assert_eq!(
+            input["report"]["fields"]["Reason_of_trip_"],
+            "Business trip"
+        );
+        assert_eq!(input["expenses"][0]["date"], "2026-07-04");
+        assert_eq!(input["expenses"][0]["amount"], json!(250));
+    }
+
+    #[test]
+    fn tag_approver_clear_sends_empty_string() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client.set_tag_approvers(
+            "P1",
+            [
+                TagApprover::assign("Engineering", "cto@example.com"),
+                TagApprover::clear("Legal"),
+            ],
+        );
+        let job = create_tag_approvers(&action);
+        assert_eq!(job["tagApprovers"][0]["approver"], "cto@example.com");
+        assert_eq!(job["tagApprovers"][1]["approver"], "");
+    }
+
+    fn create_tag_approvers(action: &SetTagApproversAction) -> Map<String, Value> {
+        set_tag_approvers(action).description().clone()
+    }
+
+    #[test]
+    fn tag_csv_sends_csv_not_cvs() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client.update_policy("P1").tags(TagsUpdate::replace_all_csv(
+            Bytes::from_static(b"Dept,Team\nEng,Core\n"),
+            TagCsvConfig::dependent(true)
+                .with_header_row()
+                .with_gl_codes(),
+        ));
+        let request = update_policy(&action);
+        let job = request.description();
+        assert_eq!(job["tags"]["action"], "replace");
+        assert_eq!(job["tags"]["source"], "file");
+        assert_eq!(job["tags"]["config"]["fileType"], "csv");
+        assert_eq!(job["tags"]["config"]["dependency"], json!(true));
+        // Dependent levels take a scalar setRequired.
+        assert_eq!(job["tags"]["config"]["setRequired"], json!(true));
+        assert_eq!(job["tags"]["config"]["header"], json!(true));
+        assert_eq!(job["tags"]["config"]["glCodes"], json!(true));
+        assert!(request.file_field().unwrap().starts_with("Dept,Team"));
+    }
+
+    #[test]
+    fn independent_tag_csv_sends_per_level_set_required() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client.update_policy("P1").tags(TagsUpdate::merge_csv(
+            Bytes::from_static(b"a,b\n"),
+            TagCsvConfig::independent([true, false]).tsv(),
+        ));
+        let job = update_policy(&action).description().clone();
+        assert_eq!(job["tags"]["config"]["setRequired"], json!([true, false]));
+        assert_eq!(job["tags"]["config"]["fileType"], "tsv");
+        assert_eq!(job["tags"]["config"]["dependency"], json!(false));
+    }
+
+    #[test]
+    fn policy_update_camel_cases_and_uses_cents() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client
+            .update_policy("P1")
+            .categories(crate::CategoriesUpdate::merge([Category::new("Meals")
+                .gl_code("6000")
+                .payroll_code("MEAL")
+                .comment_hint("why?")
+                .require_comments()
+                .max_expense_amount_cents(50_00)]))
+            .report_fields(crate::ReportFieldsUpdate::replace_all([
+                ReportFieldDef::new("Cost Center", ReportFieldType::Dropdown)
+                    .values([ReportFieldValue::new("Ops").external_id("X1")])
+                    .default_value("Ops"),
+            ]))
+            .tags(TagsUpdate::merge_inline([TagLevel::new([PolicyTag::new(
+                "Core",
+            )
+            .gl_code("7000")])
+            .named("Team")
+            .required()]));
+        let job = update_policy(&action).description().clone();
+
+        assert_eq!(job["inputSettings"]["policyID"], "P1");
+        let category = &job["categories"]["data"][0];
+        assert_eq!(job["categories"]["action"], "merge");
+        assert_eq!(category["glCode"], "6000");
+        assert_eq!(category["payrollCode"], "MEAL");
+        assert_eq!(category["commentHint"], "why?");
+        assert_eq!(category["areCommentsRequired"], json!(true));
+        assert_eq!(category["maxExpenseAmount"], json!(5000));
+
+        let field = &job["reportFields"]["data"][0];
+        assert_eq!(job["reportFields"]["action"], "replace");
+        assert_eq!(field["type"], "dropdown");
+        assert_eq!(field["defaultValue"], "Ops");
+        assert_eq!(field["values"][0]["externalID"], "X1");
+        assert_eq!(field["values"][0]["enabled"], json!(true));
+
+        let level = &job["tags"]["data"][0];
+        assert_eq!(job["tags"]["source"], "inline");
+        assert_eq!(level["name"], "Team");
+        assert_eq!(level["setRequired"], json!(true));
+        assert_eq!(level["tags"][0]["glCode"], "7000");
+    }
+
+    #[test]
+    fn update_policies_uses_the_list_key() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client.update_policies(["P1", "P2"]);
+        let job = update_policy(&action).description().clone();
+        assert_eq!(job["inputSettings"]["policyIDList"], json!(["P1", "P2"]));
+        assert!(job["inputSettings"].get("policyID").is_none());
+    }
+
+    #[test]
+    fn reimburse_pins_the_status() {
+        let request = reimburse(&ReimburseTargets::report_ids(["R1", "R2"]), Some("ACME-AP"));
+        let input = request.input();
+        assert_eq!(input["status"], "REIMBURSED");
+        assert_eq!(input["paymentSource"], "ACME-AP");
+        assert_eq!(input["filters"]["reportIDList"], "R1,R2");
+    }
+
+    #[test]
+    fn employee_feed_rides_in_the_data_field() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client
+            .update_employees(EmployeeSource::Inline(vec![
+                Employee::new("e@x.com", "m@x.com", "42", "P1")
+                    .approval_limit(500_00)
+                    .role(crate::PolicyRole::Admin)
+                    .terminated(),
+            ]))
+            .dry_run();
+        let request = update_employees(&action);
+        let job = request.description();
+        assert_eq!(job["dataSource"], "request");
+        assert_eq!(job["dry-run"], json!(true));
+        assert_eq!(job["inputSettings"]["entity"], "generic");
+
+        let feed: Value = serde_json::from_str(request.data_field().unwrap()).unwrap();
+        assert_eq!(feed[0]["employeeID"], "42");
+        assert_eq!(feed[0]["policyID"], "P1");
+        assert_eq!(feed[0]["approvalLimit"], json!(50000));
+        assert_eq!(feed[0]["role"], "admin");
+        assert_eq!(feed[0]["isTerminated"], json!(true));
+    }
+
+    #[test]
+    fn reconciliation_pins_synchronous_mode() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let template = crate::ReconciliationTemplate::new("<#list cards as c, r></#list>");
+        let action = client.domain("acme.com").reconcile(
+            &template,
+            date!(2026 - 07 - 01),
+            date!(2026 - 07 - 31),
+            ReconciliationScope::All,
+        );
+        let request = reconcile(&action);
+        let input = request.input();
+        assert_eq!(input["domain"], "acme.com");
+        assert_eq!(input["type"], "All");
+        assert_eq!(input["async"], json!(false));
+        assert_eq!(input["feed"], "export_all_feeds");
+        assert_eq!(request.description()["type"], "reconciliation");
+    }
+
+    #[test]
+    fn empty_tax_object_becomes_null() {
+        assert_eq!(normalize_tax(json!({})), Value::Null);
+        assert_eq!(normalize_tax(json!({"name": "VAT"}))["name"], "VAT");
+    }
+
+    #[test]
+    fn report_field_keys_replace_non_alphanumerics() {
+        assert_eq!(
+            normalize_report_field_key("Reason of trip"),
+            "Reason_of_trip"
+        );
+        assert_eq!(
+            normalize_report_field_key("cost-center #1"),
+            "cost_center__1"
+        );
+    }
+}
