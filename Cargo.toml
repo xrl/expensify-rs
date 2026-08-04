@@ -1,3 +1,7 @@
+[workspace]
+members = ["cli"]
+resolver = "3"
+
 [package]
 name = "expensify"
 version = "0.1.0"

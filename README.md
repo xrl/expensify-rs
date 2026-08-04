@@ -69,6 +69,26 @@ One optional feature, `employee-updater-deprecated`, gates Expensify's
 deprecated CSV employee updater. It is off by default and you almost certainly
 want the Advanced Employee Updater instead.
 
+## Command line
+
+The `cli/` package in this workspace builds an `expensify` binary over the same
+operations:
+
+```console
+$ cargo install --path cli
+$ expensify auth login                      # stored in the OS keychain
+$ expensify get policies
+$ expensify get policy 1234ABCD --with-categories --with-tax -o json
+$ expensify export reports --template month-end.ftl --since 2026-07-01
+$ expensify download export_1234.csv -O july.csv
+```
+
+Credentials resolve from `--partner-user-id`/`--partner-user-secret`, then
+`EXPENSIFY_PARTNER_USER_ID`/`EXPENSIFY_PARTNER_USER_SECRET`, then the keychain —
+so CI keeps using environment variables without touching a keychain that isn't
+there. `expensify completion <shell>` prints a completion script, and exit codes
+are documented in `expensify --help` for scripts that branch on them.
+
 ## Status
 
 Working and tested, but **the wire format has not been verified against a live
