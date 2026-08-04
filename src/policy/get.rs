@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::{DecodeError, Error};
-use crate::policy::model::{Category, PolicyEmployee, PolicyTag, ReportField, TaxConfig};
+use crate::policy::model::{Category, PolicyEmployee, PolicyTags, ReportField, TaxConfig};
 use crate::types::PolicyId;
 use crate::wire;
 
@@ -110,8 +110,9 @@ pub struct Policy<
     pub categories: Cats::Wrap<Vec<Category>>,
     /// Report fields, present when `with_report_fields()` was called.
     pub report_fields: Fields::Wrap<Vec<ReportField>>,
-    /// Tags, present when `with_tags()` was called.
-    pub tags: Tags::Wrap<Vec<PolicyTag>>,
+    /// Tags, present when `with_tags()` was called. Either shape Expensify
+    /// answers with; see [`PolicyTags`].
+    pub tags: Tags::Wrap<PolicyTags>,
     /// `None` when the policy has no tax configuration (the API returns
     /// `"tax": {}`); this `Option` is data-dependent, not request-dependent.
     pub tax: Tax::Wrap<Option<TaxConfig>>,
@@ -324,6 +325,13 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            if self.ids.is_empty() {
+                return Err(Error::InvalidRequest(
+                    "get_policies needs at least one policy ID; \
+                     an empty policyIDList is a documented 410"
+                        .to_owned(),
+                ));
+            }
             let request = wire::get_policies(&self.ids, &self.fields, self.user_email.as_deref());
             let response = self.client.send(request).await?;
 

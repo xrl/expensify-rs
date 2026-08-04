@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/ui/13_formula_report_field_def.rs:9:42
+  |
+9 |     let _ = ReportFieldDef::new("Title", ReportFieldType::Formula);
+  |             -------------------          ^^^^^^^^^^^^^^^^^^^^^^^^ expected `ReportFieldDefType`, found `ReportFieldType`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/policy/model.rs
+  |
+  |     pub fn new(name: impl Into<String>, field_type: ReportFieldDefType) -> Self {
+  |            ^^^

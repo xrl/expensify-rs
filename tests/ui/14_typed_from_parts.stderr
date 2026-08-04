@@ -1,0 +1,7 @@
+error[E0599]: no associated function or constant named `from_parts` found for struct `ExportedFile<expensify::Json<Vec<Row>>>` in the current scope
+  --> tests/ui/14_typed_from_parts.rs:11:45
+   |
+11 |     let _ = ExportedFile::<Json<Vec<Row>>>::from_parts("export_1.json", FileSystem::IntegrationServer);
+   |                                             ^^^^^^^^^^ associated function or constant not found in `ExportedFile<expensify::Json<Vec<Row>>>`
+   |
+   = note: the associated function or constant was found for `ExportedFile`

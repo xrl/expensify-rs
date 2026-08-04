@@ -1,3 +1,4 @@
+use std::fmt;
 use std::marker::PhantomData;
 
 use time::Date;
@@ -10,9 +11,14 @@ use crate::template::ExportTemplate;
 use crate::types::{PolicyId, ReportId};
 use crate::wire;
 
-/// Which reports an export selects. Constructors anchor the "at least one
-/// of reportIDList / startDate / approvedAfter" requirement: an empty
-/// query is unrepresentable.
+/// Which reports an export selects.
+///
+/// The constructors anchor Expensify's "at least one of reportIDList /
+/// startDate / approvedAfter" requirement, so there is no way to *spell* a
+/// filterless query. One hole is left, and it is closed at runtime rather
+/// than by the type: `report_ids([])` type-checks and anchors nothing, so
+/// awaiting the export returns [`Error::InvalidRequest`] instead of letting
+/// the server answer 410.
 #[derive(Clone, Debug)]
 pub struct ReportsQuery {
     pub(crate) report_ids: Vec<ReportId>,
@@ -87,6 +93,12 @@ impl ReportsQuery {
         self.marked_as_exported = Some(label.into());
         self
     }
+
+    /// `policy_ids` and `not_yet_exported_as` narrow a selection; they do
+    /// not make one.
+    pub(crate) fn anchored(&self) -> bool {
+        !self.report_ids.is_empty() || self.start_date.is_some() || self.approved_after.is_some()
+    }
 }
 
 /// A report's workflow state (`reportState`).
@@ -126,16 +138,32 @@ pub enum ExportFormat {
 
 /// SFTP endpoint, shared by the exporter's `sftpUpload` action and the
 /// employee updater's SFTP feed source.
-#[derive(Clone, Debug)]
+///
+/// [`fmt::Debug`] redacts [`SftpConnection::password`], for the same reason
+/// [`Credentials`](crate::Credentials) does: this type is reachable from
+/// the `Debug` of [`OnFinish`], every export action, and
+/// [`EmployeeSource`](crate::EmployeeSource).
+#[derive(Clone)]
 pub struct SftpConnection {
     /// Hostname or IP.
     pub host: String,
     /// Username.
     pub login: String,
-    /// Password.
+    /// Password. Never printed by [`fmt::Debug`].
     pub password: String,
     /// Port, usually 22.
     pub port: u16,
+}
+
+impl fmt::Debug for SftpConnection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SftpConnection")
+            .field("host", &self.host)
+            .field("login", &self.login)
+            .field("password", &"<redacted>")
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 /// An `onFinish` action for the Report Exporter.
@@ -289,6 +317,11 @@ impl<F> ExportReportsAction<F> {
     }
 
     /// Sets `test`: Expensify skips all `onFinish` actions.
+    ///
+    /// Sent as the string `"true"`, which is how Expensify's parameter table
+    /// types it. Not yet confirmed against a live account — if the server
+    /// were boolean-typed instead, this would be a silent no-op and
+    /// `markAsExported` (irreversible through this API) would fire.
     pub fn test_run(mut self) -> Self {
         self.test = true;
         self
@@ -301,6 +334,13 @@ impl<F: 'static> IntoFuture for ExportReportsAction<F> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            if !self.query.anchored() {
+                return Err(Error::InvalidRequest(
+                    "export needs at least one of report IDs, `since` or `approved_after`; \
+                     an empty `filters` is a documented 410"
+                        .to_owned(),
+                ));
+            }
             let request = wire::export_reports(&self);
             let response = self.client.send(request).await?;
             let name = wire::filename(response)?;
@@ -310,5 +350,30 @@ impl<F: 'static> IntoFuture for ExportReportsAction<F> {
                 FileSystem::IntegrationServer,
             ))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same rule as `Credentials`: a password must not reach a log line,
+    /// including through the `Debug` of anything that holds it.
+    #[test]
+    fn debug_redacts_the_sftp_password() {
+        let connection = SftpConnection {
+            host: "sftp.acme.com".into(),
+            login: "acme".into(),
+            password: "hunter2-super-secret".into(),
+            port: 22,
+        };
+        for rendered in [
+            format!("{connection:?}"),
+            format!("{:?}", OnFinish::sftp_upload(connection.clone())),
+        ] {
+            assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("sftp.acme.com"), "{rendered}");
+        }
     }
 }

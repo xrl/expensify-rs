@@ -44,7 +44,7 @@ impl IntoFuture for CreatePolicyAction {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let request = wire::create_policy(&self.name, self.plan);
+            let request = wire::create_policy(&self.name, self.plan.as_ref());
             let response = self.client.send(request).await?;
             wire::created_policy(response)
         })

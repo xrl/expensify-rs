@@ -74,6 +74,23 @@ fn parse_date_time(raw: &str) -> Option<PrimitiveDateTime> {
         .ok()
 }
 
+/// Expensify uses `""` rather than `null` for absent timestamps, so blank
+/// is genuinely "no value" — but an unparseable *non-blank* value means the
+/// format moved, and silently answering `None` would hide that from every
+/// caller. Same rule as `created_transactions`.
+fn optional<T>(
+    field: &str,
+    raw: Option<String>,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<Option<T>, Error> {
+    match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(value) => parse(value).map(Some).ok_or_else(|| {
+            DecodeError::custom(format!("unparseable `{field}` value `{value}`")).into()
+        }),
+    }
+}
+
 fn join<T: AsRef<str>>(items: impl IntoIterator<Item = T>) -> String {
     items
         .into_iter()
@@ -118,10 +135,11 @@ fn update_mode(mode: UpdateMode) -> &'static str {
     }
 }
 
-fn policy_plan(plan: PolicyPlan) -> &'static str {
+fn policy_plan(plan: &PolicyPlan) -> &str {
     match plan {
         PolicyPlan::Team => "team",
         PolicyPlan::Corporate => "corporate",
+        PolicyPlan::Other(raw) => raw,
     }
 }
 
@@ -329,10 +347,19 @@ fn form_fields<'a>(
 // response envelope
 // ---------------------------------------------------------------------------
 
+/// Numeric or string on the wire, and JSON has no integer type — a
+/// serializer that emits `200.0` still means 200.
 fn response_code(map: &Map<String, Value>) -> Option<u16> {
     match map.get("responseCode")? {
-        Value::Number(n) => n.as_u64()?.try_into().ok(),
-        Value::String(s) => s.parse().ok(),
+        Value::Number(n) => match n.as_u64() {
+            Some(code) => code.try_into().ok(),
+            None => {
+                let float = n.as_f64()?;
+                (float.fract() == 0.0 && (0.0..=f64::from(u16::MAX)).contains(&float))
+                    .then_some(float as u16)
+            }
+        },
+        Value::String(s) => s.trim().parse().ok(),
         _ => None,
     }
 }
@@ -406,14 +433,31 @@ fn parse_envelope(status: StatusCode, headers: &HeaderMap, body: &Bytes) -> Resu
     }
 }
 
-/// A successful download body is the file itself. Only a non-200 JSON
-/// envelope or a non-success status counts as failure — a template that
-/// happens to emit `{"responseCode": 200, ...}` is treated as content.
+/// A successful download body is the file itself, so discrimination is by
+/// shape rather than by status.
+///
+/// A JSON *object* is an envelope unless it proves otherwise: a `200` code
+/// is treated as content (a template emitting `{"responseCode": 200, ...}`
+/// is the disclosed ambiguity), any other code is that error, and an object
+/// carrying `responseMessage` with no code at all — Expensify's shape for
+/// "File not found" — is an error too, never a caller's export.
+///
+/// An empty body under HTTP 200 is also an error: a zero-byte export is
+/// never useful, and it is the most likely shape of the undocumented
+/// "not rendered yet" response. See DESIGN.md open question 1.
 fn parse_download(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Result<Bytes, Error> {
     if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&body) {
         match response_code(&map) {
-            Some(200) | None => {}
+            Some(200) => {}
             Some(code) => return Err(api_error(code, &map, headers)),
+            None if map.contains_key("responseMessage") => {
+                return Err(DecodeError::custom(format!(
+                    "download returned an error envelope: {}",
+                    response_message(&map).unwrap_or_default()
+                ))
+                .into());
+            }
+            None => {}
         }
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
@@ -426,6 +470,12 @@ fn parse_download(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Resul
             status,
             body: String::from_utf8_lossy(&body).into_owned(),
         });
+    }
+    if body.is_empty() {
+        return Err(DecodeError::custom(
+            "download returned an empty body; the export may not have finished rendering",
+        )
+        .into());
     }
     Ok(body)
 }
@@ -559,7 +609,11 @@ pub(crate) fn export_reports<F>(action: &ExportReportsAction<F>) -> JobRequest {
         );
     }
     if action.test {
-        request = request.set("test", json!(true));
+        // The doc's parameter table types `test` as String, not boolean. If
+        // a boolean were silently ignored, `.test_run()` would be a no-op
+        // and every `onFinish` — including the irreversible
+        // `markAsExported` — would fire during a believed dry run.
+        request = request.set("test", json!("true"));
     }
     request
 }
@@ -658,7 +712,7 @@ pub(crate) fn normalize_tax(value: Value) -> Value {
     }
 }
 
-pub(crate) fn create_policy(name: &str, plan: Option<PolicyPlan>) -> JobRequest {
+pub(crate) fn create_policy(name: &str, plan: Option<&PolicyPlan>) -> JobRequest {
     let mut input = Map::new();
     input.insert("type".to_owned(), json!("policy"));
     input.insert("policyName".to_owned(), json!(name));
@@ -1173,6 +1227,8 @@ pub(crate) fn update_employees_csv(policy_id: &PolicyId, csv: Bytes) -> JobReque
         let mut input = Map::new();
         input.insert("type".to_owned(), json!("employees"));
         input.insert("policyID".to_owned(), json!(policy_id));
+        // The only `fileType` in the API that is not part of a tag config.
+        input.insert("fileType".to_owned(), json!("csv"));
         input
     });
     request.multipart_data = Some(csv);
@@ -1227,35 +1283,32 @@ struct DomainCardWire {
     scrape_min_date: Option<String>,
 }
 
-/// Expensify uses `""` rather than `null` for absent card timestamps.
+/// Expensify uses `""` rather than `null` for absent card fields.
 fn blank_to_none(raw: Option<String>) -> Option<String> {
     raw.filter(|s| !s.trim().is_empty())
 }
 
 pub(crate) fn domain_cards(value: Value) -> Result<Vec<DomainCard>, Error> {
-    Ok(decode::<DomainCardListResponse>(value)?
+    decode::<DomainCardListResponse>(value)?
         .cards
         .into_iter()
-        .map(|wire| DomainCard {
-            bank: wire.bank,
-            card_id: wire.card_id,
-            card_name: wire.card_name,
-            card_number: wire.card_number,
-            email: wire.email,
-            external_employee_id: blank_to_none(wire.external_employee_id),
-            created: blank_to_none(wire.created)
-                .as_deref()
-                .and_then(parse_date_time),
-            last_import: blank_to_none(wire.last_import)
-                .as_deref()
-                .and_then(parse_date_time),
-            last_import_result: wire.last_import_result,
-            reimbursable: wire.reimbursable,
-            scrape_min_date: blank_to_none(wire.scrape_min_date)
-                .as_deref()
-                .and_then(parse_date),
+        .map(|wire| {
+            Ok(DomainCard {
+                bank: wire.bank,
+                card_id: wire.card_id,
+                card_name: wire.card_name,
+                card_number: wire.card_number,
+                email: wire.email,
+                external_employee_id: blank_to_none(wire.external_employee_id),
+                created: optional("created", wire.created, parse_date_time)?,
+                last_import: optional("lastImport", wire.last_import, parse_date_time)?,
+                last_import_result: wire.last_import_result,
+                reimbursable: wire.reimbursable,
+                // A full datetime upstream; only the date survives.
+                scrape_min_date: optional("scrapeMinDate", wire.scrape_min_date, parse_date)?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -1265,7 +1318,7 @@ mod tests {
     use super::*;
     use crate::expenses::ExpenseTax;
     use crate::policy::{
-        Category, PolicyTag, ReportFieldDef, ReportFieldType, ReportFieldValue, TagCsvConfig,
+        Category, PolicyTag, ReportFieldDef, ReportFieldDefType, ReportFieldValue, TagCsvConfig,
         TagLevel, TagsUpdate,
     };
     use crate::reports::ExpenseLine;
@@ -1357,6 +1410,56 @@ mod tests {
     }
 
     #[test]
+    fn download_envelope_without_a_code_is_not_content() {
+        let body = Bytes::from_static(br#"{"responseMessage":"File not found"}"#);
+        let err = parse_download(StatusCode::OK, &HeaderMap::new(), body).unwrap_err();
+        match err {
+            Error::Decode(DecodeError::Custom(msg)) => assert!(msg.contains("File not found")),
+            other => panic!("expected an error envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn download_empty_body_is_not_success() {
+        let err = parse_download(StatusCode::OK, &HeaderMap::new(), Bytes::new()).unwrap_err();
+        match err {
+            Error::Decode(DecodeError::Custom(msg)) => assert!(msg.contains("empty body")),
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_response_codes_are_still_codes() {
+        let body = Bytes::from_static(br#"{"responseCode":410.0,"responseMessage":"nope"}"#);
+        let err = parse_envelope(StatusCode::OK, &HeaderMap::new(), &body).unwrap_err();
+        match err {
+            Error::Api(api) => assert_eq!(api.code, 410),
+            other => panic!("expected Api, got {other:?}"),
+        }
+        let ok = Bytes::from_static(br#"{"responseCode":200.0}"#);
+        assert!(parse_envelope(StatusCode::OK, &HeaderMap::new(), &ok).is_ok());
+    }
+
+    #[test]
+    fn unparseable_card_dates_are_errors_but_blanks_are_not() {
+        let response = json!({
+            "domainCardList": [
+                { "cardID": 1, "created": "", "lastImport": "", "scrapeMinDate": "" }
+            ]
+        });
+        let cards = domain_cards(response).unwrap();
+        assert!(cards[0].created.is_none());
+
+        let broken = json!({
+            "domainCardList": [{ "cardID": 1, "created": "07/31/2026 03:04:05" }]
+        });
+        match domain_cards(broken).unwrap_err() {
+            Error::Decode(DecodeError::Custom(msg)) => assert!(msg.contains("created"), "{msg}"),
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn export_serialization_shape() {
         let client = crate::Client::new(crate::Credentials::new("id", "secret"));
         let template: crate::ExportTemplate<crate::Json<Vec<u8>>> =
@@ -1399,7 +1502,8 @@ mod tests {
         assert_eq!(job["outputSettings"]["fileBasename"], "close");
         assert_eq!(job["onFinish"][0]["actionName"], "markAsExported");
         assert_eq!(job["onFinish"][0]["label"], "acme-etl");
-        assert_eq!(job["test"], json!(true));
+        // A string, per the doc's parameter table — not a JSON boolean.
+        assert_eq!(job["test"], json!("true"));
         assert!(request.template_source().unwrap().contains("#list reports"));
         assert!(
             !job.contains_key("credentials"),
@@ -1418,6 +1522,71 @@ mod tests {
             request.description()["outputSettings"]["fileExtension"],
             "csv"
         );
+    }
+
+    #[test]
+    fn on_finish_email_and_sftp_shapes() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let template = crate::ExportTemplate::new("x");
+        let action = client
+            .export_reports(&template, ReportsQuery::report_ids(["R1"]))
+            .on_finish(OnFinish::email("a@x.com,b@x.com").message("month end"))
+            .on_finish(OnFinish::sftp_upload(SftpConnection {
+                host: "sftp.acme.com".into(),
+                login: "acme".into(),
+                password: "hunter2-super-secret".into(),
+                port: 22,
+            }));
+        let job = export_reports(&action).description().clone();
+
+        assert_eq!(job["onFinish"][0]["actionName"], "email");
+        // Comma-separated string, not an array.
+        assert_eq!(job["onFinish"][0]["recipients"], "a@x.com,b@x.com");
+        assert_eq!(job["onFinish"][0]["message"], "month end");
+        assert_eq!(job["onFinish"][1]["actionName"], "sftpUpload");
+        assert_eq!(job["onFinish"][1]["sftpData"]["host"], "sftp.acme.com");
+        assert_eq!(
+            job["onFinish"][1]["sftpData"]["password"],
+            "hunter2-super-secret"
+        );
+        assert_eq!(job["onFinish"][1]["sftpData"]["port"], json!(22));
+    }
+
+    #[test]
+    fn feed_credentials_ride_inside_credentials() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client.update_employees(EmployeeSource::FetchUrl {
+            url: "https://hr.acme.com/feed.json".into(),
+            user: Some("hr".into()),
+            password: Some("hunter2-super-secret".into()),
+        });
+        let request = update_employees(&action);
+        assert_eq!(request.description()["dataSource"], "download");
+        // Not in inputSettings: the feed credentials nest in `credentials`.
+        assert_eq!(
+            request.credential_extras["feedUrl"],
+            "https://hr.acme.com/feed.json"
+        );
+        assert_eq!(
+            request.credential_extras["feedPassword"],
+            "hunter2-super-secret"
+        );
+
+        let action = client.update_employees(EmployeeSource::Sftp {
+            connection: SftpConnection {
+                host: "sftp.acme.com".into(),
+                login: "acme".into(),
+                password: "hunter2-super-secret".into(),
+                port: 2222,
+            },
+            filename: "employees.json".into(),
+        });
+        let request = update_employees(&action);
+        assert_eq!(request.description()["dataSource"], "sftp");
+        let sftp = &request.credential_extras["sftp"];
+        assert_eq!(sftp["host"], "sftp.acme.com");
+        assert_eq!(sftp["filename"], "employees.json");
+        assert_eq!(sftp["port"], json!(2222));
     }
 
     #[test]
@@ -1542,7 +1711,7 @@ mod tests {
                 .require_comments()
                 .max_expense_amount_cents(50_00)]))
             .report_fields(crate::ReportFieldsUpdate::replace_all([
-                ReportFieldDef::new("Cost Center", ReportFieldType::Dropdown)
+                ReportFieldDef::new("Cost Center", ReportFieldDefType::Dropdown)
                     .values([ReportFieldValue::new("Ops").external_id("X1")])
                     .default_value("Ops"),
             ]))
@@ -1584,6 +1753,50 @@ mod tests {
         let job = update_policy(&action).description().clone();
         assert_eq!(job["inputSettings"]["policyIDList"], json!(["P1", "P2"]));
         assert!(job["inputSettings"].get("policyID").is_none());
+    }
+
+    #[test]
+    fn expense_rule_creator_nests_the_actions() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client
+            .create_expense_rule("P1", "user@example.com")
+            .tag("Core")
+            .default_billable(true);
+        let input = create_expense_rule(&action).input().clone();
+
+        assert_eq!(input["type"], "expenseRules");
+        assert_eq!(input["policyID"], "P1");
+        assert_eq!(input["employeeEmail"], "user@example.com");
+        assert_eq!(input["actions"]["tag"], "Core");
+        assert_eq!(input["actions"]["defaultBillable"], json!(true));
+        assert!(input.get("ruleID").is_none(), "creator has no rule to name");
+    }
+
+    #[test]
+    fn expense_rule_updater_sends_the_rule_id_as_an_integer() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let action = client
+            .update_expense_rule("P1", "user@example.com", crate::RuleId(4242))
+            .tag("Core");
+        let request = update_expense_rule(&action);
+        let input = request.input();
+
+        assert_eq!(request.description()["type"], "update");
+        assert_eq!(input["type"], "expenseRules");
+        assert_eq!(input["ruleID"], json!(4242));
+        assert_eq!(input["actions"]["tag"], "Core");
+        // Unset knobs are absent, not null.
+        assert!(input["actions"].get("defaultBillable").is_none());
+    }
+
+    #[cfg(feature = "employee-updater-deprecated")]
+    #[test]
+    fn deprecated_csv_updater_declares_its_file_type() {
+        let request = update_employees_csv(&PolicyId::new("P1"), Bytes::from_static(b"a,b\n"));
+        let input = request.input();
+        assert_eq!(input["type"], "employees");
+        assert_eq!(input["policyID"], "P1");
+        assert_eq!(input["fileType"], "csv");
     }
 
     #[test]

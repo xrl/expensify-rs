@@ -122,6 +122,10 @@ impl IntoFuture for CreateReportAction {
 
 /// Which reports a reimbursement targets. Anchored constructors:
 /// Expensify requires `reportIDList` or `startDate`.
+///
+/// `report_ids([])` anchors nothing despite type-checking; awaiting it
+/// returns [`Error::InvalidRequest`] rather than sending an empty
+/// `filters`.
 #[derive(Clone, Debug)]
 pub struct ReimburseTargets {
     pub(crate) report_ids: Vec<ReportId>,
@@ -157,6 +161,10 @@ impl ReimburseTargets {
         self.end_date = Some(end);
         self
     }
+
+    fn anchored(&self) -> bool {
+        !self.report_ids.is_empty() || self.start_date.is_some()
+    }
 }
 
 /// Strict mode marker (default): a 207 partial success is an error.
@@ -172,6 +180,16 @@ pub struct Tolerant;
 /// By default a 207 (some reports skipped/failed) is
 /// [`Error::PartialSuccess`]; [`ReimburseAction::tolerate_partial`]
 /// switches the output type to the full [`ReimburseOutcome`] instead.
+///
+/// # Unverified: partial success may not always be a 207
+///
+/// Expensify's docs say non-Approved reports "will be ignored", without
+/// stating that this always produces a 207. If a run can ignore reports
+/// under a plain 200, then the strict path's `Vec<ReportId>` can come back
+/// **shorter than the request** and still be `Ok` — indistinguishable from
+/// full success, which is the exact bug the strict/tolerant split exists to
+/// close. Until that is confirmed against a live account, compare the
+/// returned IDs against the ones you asked for if the distinction matters.
 #[must_use = "actions do nothing until awaited"]
 pub struct ReimburseAction<Mode = Strict> {
     client: Client,
@@ -211,6 +229,13 @@ impl<Mode> ReimburseAction<Mode> {
     }
 
     async fn run(self) -> Result<(bool, ReimburseOutcome), Error> {
+        if !self.targets.anchored() {
+            return Err(Error::InvalidRequest(
+                "reimbursement needs report IDs or `since`; \
+                 an empty `filters` is a documented 410"
+                    .to_owned(),
+            ));
+        }
         let request = wire::reimburse(&self.targets, self.payment_source.as_deref());
         let response = self.client.send(request).await?;
         let partial = wire::is_partial(&response);
