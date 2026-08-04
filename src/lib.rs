@@ -68,6 +68,20 @@ mod template;
 mod types;
 mod wire;
 
+/// The HTTP client this crate is built on, re-exported.
+///
+/// Four of its types are part of this crate's public API —
+/// [`Url`] on [`ClientBuilder::base_url`],
+/// [`reqwest::Client`] on [`ClientBuilder::http_client`],
+/// [`reqwest::Error`] inside [`Error::Transport`], and
+/// [`reqwest::StatusCode`] inside [`Error::Http`] — so naming them must not
+/// require a second dependency (and a second dependency risks a *different*
+/// major version of reqwest, whose types would not be these types).
+pub use reqwest;
+
+/// URL type accepted by [`ClientBuilder::base_url`].
+pub use reqwest::Url;
+
 pub use cards::*;
 pub use client::*;
 pub use employees::*;

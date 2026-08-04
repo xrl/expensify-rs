@@ -6,8 +6,8 @@
 
 use expensify::{
     ApiErrorKind, Client, Credentials, Error, ExportFormat, ExportTemplate, FileSystem, Json,
-    PolicyPlan, PolicyRole, PolicyTags, ReconciliationScope, ReconciliationTemplate,
-    ReimburseTargets, ReportFieldType, ReportsQuery,
+    PolicyField, PolicyPlan, PolicyRole, PolicyTags, ReconciliationScope, ReconciliationTemplate,
+    ReimburseTargets, ReportFieldType, ReportsQuery, Url,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -51,7 +51,7 @@ async fn server_with(response: ResponseTemplate) -> MockServer {
 
 fn client(server: &MockServer) -> Client {
     Client::builder(Credentials::new("partner-id", "partner-secret"))
-        .base_url(server.uri().parse().unwrap())
+        .base_url(Url::parse(&server.uri()).expect("wiremock hands back a valid URL"))
         .no_rate_limiting()
         .build()
 }
@@ -555,6 +555,172 @@ async fn policy_getter_reads_report_fields_and_employees() {
     let requests = server.received_requests().await.unwrap();
     let input = &job(&requests[0]).unwrap()["inputSettings"];
     assert_eq!(input["fields"], json!(["reportFields", "employees"]));
+}
+
+// ---------------------------------------------------------------------------
+// policy getter, dynamic escape hatch
+// ---------------------------------------------------------------------------
+
+fn two_section_policy() -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "responseCode": 200,
+        "policyInfo": {
+            "P1": {
+                "categories": [{ "name": "Infrastructure", "enabled": true }],
+                "tax": { "name": "VAT", "default": "id_A",
+                         "rates": [{ "name": "Standard", "rate": 20.0, "rateID": "id_A" }] }
+            }
+        }
+    }))
+}
+
+#[tokio::test]
+async fn dynamic_getter_populates_only_requested_sections() {
+    let server = server_with(two_section_policy()).await;
+
+    let id = expensify::PolicyId::new("P1");
+    let policies = client(&server)
+        .get_policies_dynamic([&id], [PolicyField::Categories, PolicyField::Tax])
+        .await
+        .unwrap();
+
+    let policy = &policies[&id];
+    assert_eq!(
+        policy.categories.as_ref().unwrap()[0].name,
+        "Infrastructure"
+    );
+    assert_eq!(policy.tax.as_ref().unwrap().as_ref().unwrap().name, "VAT");
+    // Not requested: absent, not empty.
+    assert!(policy.report_fields.is_none());
+    assert!(policy.tags.is_none());
+    assert!(policy.employees.is_none());
+
+    let requests = server.received_requests().await.unwrap();
+    let input = &job(&requests[0]).unwrap()["inputSettings"];
+    assert_eq!(input["fields"], json!(["categories", "tax"]));
+}
+
+/// The point of sharing one request path: a selection made either way must
+/// put the same bytes on the wire.
+#[tokio::test]
+async fn dynamic_and_static_selections_send_the_same_request() {
+    let server = server_with(two_section_policy()).await;
+    let id = expensify::PolicyId::new("P1");
+
+    client(&server)
+        .get_policies([&id])
+        .with_categories()
+        .with_tax()
+        .await
+        .unwrap();
+    client(&server)
+        .get_policies_dynamic([&id], &[PolicyField::Categories, PolicyField::Tax])
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        job(&requests[0]).unwrap()["inputSettings"],
+        job(&requests[1]).unwrap()["inputSettings"]
+    );
+}
+
+/// The static path cannot select a field twice; a `Vec` can.
+#[tokio::test]
+async fn a_repeated_field_is_sent_once() {
+    let server = server_with(two_section_policy()).await;
+
+    client(&server)
+        .get_policies_dynamic(["P1"], [PolicyField::Tax, PolicyField::Tax])
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let input = &job(&requests[0]).unwrap()["inputSettings"];
+    assert_eq!(input["fields"], json!(["tax"]));
+}
+
+/// The compile-time "at least one field" rule (`GetPoliciesBuilder` is not a
+/// future) has no compile-time equivalent here, so it becomes a pre-flight
+/// rejection — and, as with the empty-ID list, nothing is sent.
+#[tokio::test]
+async fn an_empty_dynamic_selection_is_rejected_before_sending() {
+    let server = server_with(two_section_policy()).await;
+
+    let err = client(&server)
+        .get_policies_dynamic(["P1"], Vec::<PolicyField>::new())
+        .await
+        .expect_err("an empty fields list is a documented 410");
+
+    match err {
+        Error::InvalidRequest(message) => {
+            assert!(message.contains("at least one field"), "{message}")
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// The escape hatch gives up compile-time shaping, not the decode checks:
+/// a section that was asked for and did not come back is still an error, not
+/// a silent `None`.
+#[tokio::test]
+async fn a_requested_section_missing_from_the_response_is_an_error() {
+    let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
+        "responseCode": 200,
+        "policyInfo": { "P1": { "categories": [] } }
+    })))
+    .await;
+
+    let err = client(&server)
+        .get_policies_dynamic(["P1"], [PolicyField::Categories, PolicyField::Employees])
+        .await
+        .expect_err("`employees` was requested and is absent");
+
+    match err {
+        Error::Decode(decode) => assert!(format!("{decode}").contains("employees"), "{decode}"),
+        other => panic!("expected Decode, got {other:?}"),
+    }
+}
+
+/// `on_behalf_of` is the one setter both getters carry.
+#[tokio::test]
+async fn dynamic_getter_carries_on_behalf_of() {
+    let server = server_with(two_section_policy()).await;
+
+    client(&server)
+        .get_policies_dynamic(["P1"], [PolicyField::Tax])
+        .on_behalf_of("finance@acme.com")
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let input = &job(&requests[0]).unwrap()["inputSettings"];
+    assert_eq!(input["userEmail"], "finance@acme.com");
+}
+
+/// A statically-typed result projects down to the same shape the dynamic
+/// getter returns.
+#[tokio::test]
+async fn a_static_result_projects_to_the_dynamic_shape() {
+    let server = server_with(two_section_policy()).await;
+    let id = expensify::PolicyId::new("P1");
+
+    let statically = client(&server)
+        .get_policies([&id])
+        .with_categories()
+        .with_tax()
+        .await
+        .unwrap();
+    let dynamically = client(&server)
+        .get_policies_dynamic([&id], [PolicyField::Categories, PolicyField::Tax])
+        .await
+        .unwrap();
+
+    let projected = statically[&id].clone().project();
+    assert_eq!(projected.categories, dynamically[&id].categories);
+    assert_eq!(projected.tax, dynamically[&id].tax);
+    assert!(projected.employees.is_none());
 }
 
 /// `PolicySummary`'s renames (`type` -> plan, `outputCurrency`) are only

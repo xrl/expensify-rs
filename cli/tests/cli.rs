@@ -31,6 +31,8 @@ const COMMAND_PATHS: &[&[&str]] = &[
     &["update", "employees"],
     &["reimburse"],
     &["completion"],
+    &["skill"],
+    &["skill", "install"],
 ];
 
 fn expensify(args: &[&str]) -> Output {
@@ -193,6 +195,48 @@ fn pdf_export_is_not_offered() {
         "pdf",
     ]);
     assert_eq!(code(&output), 2);
+}
+
+/// The skill installer is the one command that writes to the filesystem, so
+/// the whole path is exercised end to end: no credentials, no network, and no
+/// silent overwrite.
+#[test]
+fn installing_the_skill_never_clobbers_silently() {
+    let root = std::env::temp_dir().join(format!("expensify-cli-skill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let root = root.to_str().expect("a UTF-8 temp path");
+    let path = std::path::Path::new(root)
+        .join("expensify")
+        .join("SKILL.md");
+
+    let printed = expensify(&["skill", "install", "--print"]);
+    assert_eq!(code(&printed), 0);
+    assert!(!path.exists(), "--print must install nothing");
+
+    let installed = expensify(&["skill", "install", "--skills-dir", root, "-o", "json"]);
+    assert_eq!(code(&installed), 0, "{}", stderr(&installed));
+    let written = std::fs::read_to_string(&path).expect("the skill was not written");
+    assert_eq!(
+        written.as_bytes(),
+        printed.stdout,
+        "--print differs from --install"
+    );
+    assert!(
+        String::from_utf8_lossy(&installed.stdout).contains(&path.display().to_string()),
+        "the installed path must be reported: {installed:?}"
+    );
+
+    std::fs::write(&path, "edited by hand").unwrap();
+    let refused = expensify(&["skill", "install", "--skills-dir", root]);
+    assert_eq!(code(&refused), 2, "a second install must be a usage error");
+    assert!(stderr(&refused).contains("--force"), "{}", stderr(&refused));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited by hand");
+
+    let forced = expensify(&["skill", "install", "--skills-dir", root, "--force"]);
+    assert_eq!(code(&forced), 0, "{}", stderr(&forced));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), written);
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
