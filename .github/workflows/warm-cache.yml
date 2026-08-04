@@ -11,7 +11,7 @@ name: warm-cache
 # off the 10 GB cache ceiling, which PR-side saves had already pushed us to.
 on:
   push:
-    branches: [main, ci-build-caching] # TEMP: revert before merge
+    branches: [main]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
@@ -33,11 +33,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Debuginfo dominated the cached target dir (440 MB), and restore time is now
-  # the bulk of a warm job. Line tables keep panic backtraces pointing at real
-  # file:line while dropping the variable/type DWARF that CI never reads.
-  # rust-cache hashes CARGO_* into its key, so this must match in warm-cache.yml.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   # One cache for every stable-toolchain job in ci.yml. The four clippy/test
