@@ -1,13 +1,12 @@
 # expensify-rs design
 
 Type-system design for a Rust client for the Expensify Integration Server
-API. Deliverable is this document; `src/` holds a compiling skeleton
-(`todo!()` bodies) that is signature-authoritative — every public type,
-bound, and `IntoFuture` impl below exists there and passes `cargo check`
-(both default and `employee-updater-deprecated` feature sets).
-`examples/tour.rs` compiles the running example; every entry in
-[§ Misuses](#misuses-made-uncompilable) was verified to fail compilation
-with the quoted error class.
+API. `src/` is signature-authoritative — every public type, bound, and
+`IntoFuture` impl below exists there and passes `cargo check` (both default
+and `employee-updater-deprecated` feature sets). `examples/tour.rs`
+compiles the running example; every entry in
+[§ Misuses](#misuses-made-uncompilable) has a `tests/ui/` case verified to
+fail compilation with the quoted error class.
 
 Source of truth: <https://integrations.expensify.com/Integration-Server/doc/>
 and `doc/employeeUpdater/`, read 2026-08-04. No OpenAPI spec exists (the
@@ -35,6 +34,11 @@ Corrections/refinements to the pre-read map, verified against the docs:
   design assumes the stricter pair.
 - Doc typo: policy-updater tag `fileType` is listed as `"cvs"`/`"tsv"`;
   the example JSON uses `"csv"`. Send `"csv"`.
+- The Policy Getter answers `tags` in **two** shapes on the same doc page:
+  a flat tag list, and a list of tag *levels* each wrapping its own
+  `tags`. Both are modelled (`PolicyTags`), because guessing one makes the
+  other a hard decode failure for the whole multi-policy response.
+- `test` is typed `String` in the exporter parameter table, not boolean.
 
 ## Running example
 
@@ -125,10 +129,18 @@ types carry serde attrs only where the mapping is 1:1.
 
 Wire mapping notes: all JSON keys camelCase (`#[serde(rename_all)]` or
 explicit renames); amounts are integer cents; `reportState` is a
-comma-joined list; exporter `limit` serializes as a string; report-field
-keys are normalized (non-alphanumeric → `_`) client-side before sending;
-`Employee` feed serializes to the documented JSON array;
+comma-joined list; exporter `limit` and `test` serialize as strings;
+report-field keys are normalized (non-alphanumeric → `_`) client-side
+before sending; `Employee` feed serializes to the documented JSON array;
 `TagApprover::clear` serializes `approver: ""`.
+
+Deserialization rules the open vocabulary imposes: every enum whose values
+Expensify controls (`PolicyPlan`, `PolicyRole`, `ReportFieldType`) carries
+an `Other(String)` catch-all, because one policy on an unmodelled plan must
+not fail an entire `list_policies()`. Enums this crate *sends* stay closed.
+Optional-on-the-wire booleans (`enabled`) default rather than fail. A blank
+string is absence; a *non-blank* value that will not parse is
+`DecodeError`, never a silent `None`.
 
 ## Client, credentials, domain scope
 
@@ -246,8 +258,15 @@ download path never asks for a file system. Persistence story:
 along, and `#[serde(bound = "")]` keeps `F` unconstrained), so a
 serde round trip preserves both guarantees. For filenames stored as bare
 strings out-of-band, `from_parts` exists but is restricted to
-`ExportedFile<Bytes>` — you can re-assert a file system, but you cannot
-conjure a typed decode from a bare string.
+`ExportedFile<Bytes>`.
+
+Scope of that restriction, stated precisely: `from_parts` is the only
+*constructor* on the typed form, and it is absent there. `Deserialize` is
+not — `#[serde(bound = "")]` is what makes the typed round trip work, and
+the same impl accepts a hand-written `{"name":..,"file_system":..}`, so a
+determined caller can mint an `ExportedFile<Json<Row>>` from a bare string
+through serde. That is the accepted cost of the persistence story: the
+guarantee is "you will not do this by accident", not "you cannot do this".
 
 ```rust
 impl Client {
@@ -266,8 +285,9 @@ the handle; rendering continues server-side (poll by downloading —
 no ready-signal exists, see Open questions). Reconciliation is
 synchronous, so its handle is immediately downloadable.
 
-`ReportsQuery` (anchored constructors; an empty filter set — a documented
-410 — is unrepresentable):
+`ReportsQuery` (anchored constructors: there is no way to *spell* an empty
+filter set — a documented 410 — though an empty iterator can still produce
+one, see [§ Misuses](#misuses-made-uncompilable) entry 7):
 
 ```rust
 pub struct ReportsQuery;   // Clone, Debug; all fields private
@@ -294,8 +314,11 @@ surfaces as a decode error, not silent corruption.
 
 `OnFinish` constructors: `mark_as_exported(label)`,
 `email(recipients).message(text)`, `sftp_upload(SftpConnection)`.
-`SftpConnection { host, login, password, port: u16 }` (Clone, Debug —
-public fields; shared with the employee updater's SFTP source).
+`SftpConnection { host, login, password, port: u16 }` (Clone; public
+fields; shared with the employee updater's SFTP source). `Debug` is
+**manual and redacts `password`** — same rule as `Credentials`, and it
+matters more here because `SftpConnection` is reachable from the `Debug` of
+`OnFinish`, of every export action, and of `EmployeeSource`.
 
 `ReconcileAction<F>` (`DomainClient::reconcile`): required args carry
 `start`, `end`, `ReconciliationScope::{Unreported, All}`; setters
@@ -333,7 +356,7 @@ pub struct Policy<Cats = Omitted, Fields = Omitted, Tags = Omitted, Tax = Omitte
 where /* all: FetchState */ {
     pub categories:    Cats::Wrap<Vec<Category>>,
     pub report_fields: Fields::Wrap<Vec<ReportField>>,
-    pub tags:          Tags::Wrap<Vec<PolicyTag>>,
+    pub tags:          Tags::Wrap<PolicyTags>,        // Flat | Levels — see below
     pub tax:           Tax::Wrap<Option<TaxConfig>>,   // Option = "policy has no tax config"
     pub employees:     Emps::Wrap<Vec<PolicyEmployee>>,
 }
@@ -343,6 +366,14 @@ pub type Policies<..> = HashMap<PolicyId, Policy<..>>;
 The `Option` inside `tax` is deliberate: it encodes data-dependent
 absence (`"tax": {}` on the wire), not request-dependent absence — the
 distinction this whole mechanism exists to draw.
+
+`tags` is an enum for the same reason it is not an `Option`: Expensify's
+own documented sample answers `tags` flat for one policy and level-wrapped
+for another, so the shape is genuine data, not a knob. Forcing one shape
+would make the other a `DecodeError` for the *entire* `policyInfo` map —
+one level-wrapped policy discarding every other policy's data. `PolicyTags`
+exposes both variants plus `.tags()` for callers who do not care about
+levels.
 
 Two-stage builder enforces the API's "at least one field" requirement:
 
@@ -448,6 +479,7 @@ derives, and intent per module. Derives shorthand: **SD** =
     Transport(#[from] reqwest::Error),
     RateLimited { retry_after: Option<Duration> },       // HTTP 429 or body code 429
     Api(ApiError),                                       // body responseCode != 200/207, any HTTP status
+    InvalidRequest(String),                              // rejected before sending; see misuse 7
     Http { status: reqwest::StatusCode, body: String },  // non-success HTTP, unrecognizable body
     Decode(#[from] DecodeError),                         // envelope decode or FromExport failure
     PartialSuccess(Box<ReimburseOutcome>),               // 207 on the strict reimburse path only
@@ -463,7 +495,9 @@ impl DecodeError { pub fn custom(impl Into<String>) -> Self }   // for user From
 HTTP 200 never implies success: the wire layer parses the body envelope
 first and maps its `responseCode`. 429 from either layer becomes
 `RateLimited` (`retry_after` from the header if present — likely absent,
-hence `Option`). `PartialSuccess` is the one operation-specific variant;
+hence `Option`). `InvalidRequest` is the pre-flight rejection for requests
+the type system cannot refuse but Expensify documents as a 410 — today,
+only empty collections. `PartialSuccess` is the one operation-specific variant;
 accepted because 207 is a documented cross-cutting code that today only
 the reimburse job emits, and a per-op error enum for one job is worse.
 
@@ -497,13 +531,29 @@ Xlsx, Txt, Pdf, Json, Xml), `SftpConnection` (Clone, Debug, pub fields),
     Builder: `new(name)` (enabled), `.disabled()`, `.gl_code()`,
     `.payroll_code()`, `.require_comments()`, `.comment_hint()`,
     `.max_expense_amount_cents()`.
-  - `PolicyTag { name, enabled, gl_code: Option<String> }` — same style.
-  - `ReportFieldType` — Copy, Eq, SD lowercase: Formula (read-only —
-    getter emits it, updater rejects it), Text, Dropdown, Date.
-  - `ReportField { name, field_type, values: Vec<String> }` — getter
-    shape, Deserialize only.
-  - `ReportFieldDef { name, field_type, values: Vec<ReportFieldValue>,
-    default_value: Option<String> }` — updater shape, Serialize only.
+  - `PolicyTag { name, enabled, gl_code: Option<String> }` — same style;
+    `enabled` also defaults to true.
+  - `PolicyTagLevel { name: Option<String>, tags: Vec<PolicyTag> }` —
+    getter's level shape, Deserialize only. No "required" flag: the
+    getter sample does not carry one and inventing a wire key would be a
+    guess.
+  - `PolicyTags` — Clone, Debug, PartialEq, `#[non_exhaustive]`;
+    `Flat(Vec<PolicyTag>)` | `Levels(Vec<PolicyTagLevel>)`, plus
+    `.tags()`. Hand-written `Deserialize` (discriminates on the presence
+    of a `tags` key), not `#[serde(untagged)]`, whose "did not match any
+    variant" swallows the real shape error.
+  - `ReportFieldType` — Clone, Eq, Deserialize lowercase,
+    `#[non_exhaustive]`: Formula (read-only — the getter emits it), Text,
+    Dropdown, Date, `Other(String)`. Read side only.
+  - `ReportFieldDefType` — Copy, Eq, Serialize lowercase: Text, Dropdown,
+    Date. The updater's documented set. Separate from `ReportFieldType`
+    so `Formula` is not statable on a `ReportFieldDef` (misuse 13) and so
+    the read side can stay open without opening the write side.
+  - `ReportField { name, field_type: ReportFieldType, values: Vec<String> }`
+    — getter shape, Deserialize only.
+  - `ReportFieldDef { name, field_type: ReportFieldDefType,
+    values: Vec<ReportFieldValue>, default_value: Option<String> }` —
+    updater shape, Serialize only.
     `new(name, type)`, `.values(iter Into<ReportFieldValue>)`,
     `.default_value()`. Values always serialize in object form, which
     satisfies Expensify's "uniformly strings or uniformly objects" rule
@@ -512,11 +562,17 @@ Xlsx, Txt, Pdf, Json, Xml), `SftpConnection` (Clone, Debug, pub fields),
     `new`, `.disabled()`, `.external_id()`, `From<&str>/<String>`.
   - `TaxConfig { name, default: TaxRateId, rates: Vec<TaxRate> }`;
     `TaxRate { name, rate: f64, rate_id: TaxRateId }` — Deserialize.
-  - `PolicyRole` — Copy, Eq, SD lowercase: User, Auditor, Admin.
+  - `PolicyRole` — Clone, Eq, SD lowercase, `#[non_exhaustive]`: User,
+    Auditor, Admin, `Other(String)`. Not `Copy`: the catch-all carries the
+    raw string. It is also the one open enum this crate *sends*
+    (`Employee::role`); an `Other` there is a server-side rejection, which
+    is the accepted cost of one type serving both directions.
   - `PolicyEmployee { email, role, submits_to, employee_id,
     custom_field_1, custom_field_2 }` — Deserialize.
-  - `PolicyPlan` — Copy, Eq, SD lowercase: Team, Corporate (wire key
-    `type`; renamed to avoid a third meaning of "type").
+  - `PolicyPlan` — Clone, Eq, SD lowercase, `#[non_exhaustive]`: Team,
+    Corporate, `Other(String)` (wire key `type`; renamed to avoid a third
+    meaning of "type"). `free`, `control` and `personalPolicy` are all
+    observed and undocumented.
   - `PolicySummary { id, name, owner, role, output_currency, plan }` —
     Deserialize.
 - `get.rs` — `Payload`, `FetchState` (sealed), `Fetched`, `Omitted`,
@@ -594,6 +650,7 @@ documents no response body for these jobs.
   `FetchUrl { url, user, password }` (`"download"`),
   `Sftp { connection: SftpConnection, filename }` (`"sftp"`). An enum,
   not typestate: three mutually exclusive wire shapes, no sequencing.
+  Clone; `Debug` is manual and redacts the feed password.
 - `PrimaryPolicyMode` — None, NewEmployees, AllEmployees.
 - `UpdateEmployeesAction` — `.dry_run()`, `.primary_policy(mode)`,
   `.no_approval_chain_fixes()` (server default on),
@@ -625,8 +682,22 @@ reimbursable: bool, scrape_min_date: Option<Date> /* "" → None */ }`;
 ## Rate limiting
 
 Built-in and on by default; invisible per-operation. `RateGate` holds two
-`governor::DefaultDirectRateLimiter`s (quota 5/10 s and 20/60 s); every
-send awaits both. Opt-out is `ClientBuilder::no_rate_limiting()` — the
+`governor::DefaultDirectRateLimiter`s (5/10 s and 20/60 s); every
+send awaits both.
+
+The quota spelling matters and is easy to get wrong: GCRA admits
+`burst + elapsed/period` cells, so `with_period(window / budget)
+.allow_burst(budget)` — the obvious reading — admits the burst *on top of*
+a full window's replenishment, roughly double the published rate on a cold
+start or after any idle gap. The limiter exists only to prevent 429s, so it
+keeps the implicit burst of one and spreads the remaining `budget - 1`
+cells across the window, making `budget` per `window` an upper bound at
+every offset. Only the first send is instant; the 60 s budget is the
+binding one thereafter (~3.2 s between sends). Deliberately
+under-shooting: a client that is slightly too slow is strictly better than
+one that gets 429ed.
+
+Opt-out is `ClientBuilder::no_rate_limiting()` — the
 limiter is process-local, so multi-process deployments sharing one
 credential need an external governor and will still see
 `Error::RateLimited`, which is why 429 remains a surfaced error rather
@@ -702,8 +773,16 @@ classes quoted from rustc).
    a future.
 6. **ID swaps**: `.report_id(policy_id)` — E0277:
    `ReportId: From<PolicyId>` not satisfied.
-7. **Filterless export** (documented 410): `ReportsQuery` has only
-   anchored constructors — `ReportsQuery::default()` is E0599.
+7. **A filterless export constructor** (documented 410): `ReportsQuery`
+   has only anchored constructors — `ReportsQuery::default()` is E0599.
+   **Scope, honestly:** this closes the *spelling*, not the request. An
+   empty iterator is well-typed — `ReportsQuery::report_ids([])`,
+   `ReimburseTargets::report_ids([])`, `get_policies([])`,
+   `update_policies([])` all anchor nothing and would serialize the exact
+   `"filters": {}` / empty `policyIDList` the API answers 410 to. No type
+   can see the length of an iterator, so those four are **runtime**-
+   rejected instead: awaiting returns `Error::InvalidRequest` and nothing
+   is sent.
 8. **Silently ignoring partial reimbursement**: strict output is
    `Vec<ReportId>` — `outcome.skipped` is E0609; there is no list to
    forget, and an actual 207 is `Err`. Reaching `ReimburseOutcome`
@@ -719,8 +798,22 @@ classes quoted from rustc).
 12. **`setRequired` shape mismatch on tag CSVs** (scalar vs per-level):
     unrepresentable — `TagCsvConfig::dependent` takes `bool`,
     `::independent` takes an iterator; there is no field to set wrongly.
+13. **A formula report field on the updater** (the updater documents only
+    text/dropdown/date): `ReportFieldDef::new(name,
+    ReportFieldType::Formula)` — E0308, the constructor takes the narrower
+    `ReportFieldDefType`.
+14. **A typed decode conjured from a bare filename**:
+    `ExportedFile::<Json<Row>>::from_parts(..)` — E0599; the escape hatch
+    exists only on `ExportedFile<Bytes>`. (Not airtight — see the serde
+    caveat in [§ Exports](#exports-templates-files-download).)
+15. **A third `FetchState`**: `impl FetchState for Mine` — E0277, the
+    supertrait is private. A third state has no meaning and would break
+    `extract`'s contract.
+16. **Reconciliation template fed to the exporter** — the reverse of case
+    3; E0308, expected `&ExportTemplate<_>`.
 
-Runtime-but-loud (not compile errors, by design): destructive tag/
+Runtime-but-loud (not compile errors, by design): empty collections are
+`Error::InvalidRequest` before anything is sent (case 7); destructive tag/
 category replacement is spelled `replace_all_*`; clearing a tag approver
 is `TagApprover::clear`, not an empty string; every action is
 `#[must_use]`.
@@ -731,7 +824,8 @@ is `TagApprover::clear`, not an empty string; every action is
 
 | wire | here | why |
 |---|---|---|
-| `type` (policy plan) | `PolicyPlan::{Team, Corporate}` | `type` already means job and inputSettings discriminators |
+| `type` (policy plan) | `PolicyPlan::{Team, Corporate, Other}` | `type` already means job and inputSettings discriminators |
+| `type` (report field) | `ReportFieldType` (read) / `ReportFieldDefType` (write) | one wire key, two vocabularies — the updater rejects `formula` |
 | `filters.markedAsExported` | `not_yet_exported_as(label)` | the filter *excludes* already-exported reports; wire name reads inverted |
 | `maxExpenseAmount`, `amount` | `*_cents` / `Money` | cents-vs-currency-units is the classic money bug |
 | `reportStatus` update | `mark_reports_reimbursed` | only one status exists; encode it in the verb |
@@ -749,8 +843,11 @@ is `TagApprover::clear`, not an empty string; every action is
   because the domain *string* is required job data. Permission
   requirements are doc comments plus `ApiErrorKind::InvalidPermissions`.
 - **Typestate for "≥1 filter" on `ReportsQuery`** — anchored
-  constructors achieve the same unrepresentability with zero type
-  parameters and better error messages.
+  constructors get most of the way with zero type parameters and better
+  error messages. They cannot see an empty iterator, and no type
+  parameterization can, so that residue is a runtime check
+  (`Error::InvalidRequest`) rather than a reason to add five type
+  parameters that would still not close it.
 - **`Option<TaxConfig>` elimination** — kept: `{}` on the wire is
   genuine data-dependent absence, exactly what `Option` is for.
 - **Generic `WriteModel`-style job enum** — Expensify jobs share nothing
@@ -768,6 +865,15 @@ is `TagApprover::clear`, not an empty string; every action is
    v1 surfaces whatever error comes back; if probing shows a stable
    signal, add `DownloadAction::poll_until_ready(interval, timeout)`.
    Needs a live credential to characterize.
+
+   **Decided in the meantime:** an empty body under HTTP 200 is an
+   `Error`, not `Ok(Bytes::new())`. A zero-byte export is never a useful
+   result, it is the likeliest shape of "not rendered yet", and reporting
+   it as success is the silent-failure class this crate exists to prevent
+   — for `Bytes`/`String` markers it would hand an ETL an empty file and
+   call the night's run a success. The cost is that a genuinely empty
+   export has no accepting path; if probing ever shows one, this is the
+   decision to revisit.
 2. **429 auto-retry.** Currently surfaced as `Error::RateLimited` with
    no retry. A `ClientBuilder::retry_rate_limited(max: u32)` knob is a
    natural v1.1 addition — rule on whether it belongs in v1.
@@ -787,9 +893,33 @@ is `TagApprover::clear`, not an empty string; every action is
 6. **Rate-limit figures** — if the "50 jobs/minute" page resurfaces,
    confirm whether it's a separate *job-start* budget on top of the
    request budget; the limiter currently models requests only.
-7. **`test` flag encoding.** Sent as a JSON boolean, on the grounds that
-   § "Wire mapping notes" lists `limit` as the only string-serialized
-   quirk. The docs show `"test"` in prose without a literal. If the
-   exporter silently ignores a boolean, `.test_run()` is a no-op and
-   `onFinish` fires during what the caller believes is a dry run — the
-   highest-consequence unverified guess in the wire layer.
+7. **`test` flag encoding — resolved against the earlier guess.** The
+   exporter's parameter table types `test` as **String** (`true, false`),
+   so the string `"true"` is what goes on the wire; an earlier draft sent
+   a JSON boolean. Still unconfirmed live: if the server is
+   boolean-typed instead, `.test_run()` is a silent no-op and every
+   `onFinish` fires during a believed dry run, including the effectively
+   irreversible `markAsExported` and the actually-transmitting `email` /
+   `sftpUpload`. Follow the documented type until a live probe says
+   otherwise — a wrong `test` is the highest-consequence guess in the
+   wire layer, and the docs are the only evidence available.
+8. **`reportFields.data.values` object key.** The parameter table says
+   `value`; the worked example says `name`. The implementation follows
+   the example. The docs contradict themselves; probe.
+9. **Whether `action` is honoured for tag updates.** The inline-tags
+   table documents no `action` key and the prose says a tags update
+   "replaces the existing tags of the policy". If `action: "merge"` is
+   ignored, `TagsUpdate::merge_inline` / `merge_csv` are destructive —
+   the exact failure the `replace_all_*` naming exists to prevent. Both
+   methods carry a loud rustdoc warning; the naming cannot be fixed
+   blind. Highest-consequence of the unresolved five.
+10. **Whether a partial reimbursement is always a 207.** The docs say
+    non-Approved reports "will be ignored", without saying under which
+    code. If a run can ignore reports under a plain 200, the strict
+    path's `Ok(Vec<ReportId>)` can be shorter than the request and still
+    look like full success — reopening misuse 8 from the server side.
+    Documented on `ReimburseAction`; not fixable without evidence.
+11. **Report-field key normalization case.** Expensify's rule text
+    matches this implementation (non-alphanumeric → `_`, case
+    preserved), but its worked example's keys are all lowercase.
+    Probably nothing; confirm before adding a `to_lowercase`.

@@ -105,6 +105,12 @@ impl From<String> for Currency {
     }
 }
 
+impl From<&Currency> for Currency {
+    fn from(c: &Currency) -> Self {
+        c.clone()
+    }
+}
+
 impl fmt::Display for Currency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)

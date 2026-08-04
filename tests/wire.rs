@@ -6,7 +6,8 @@
 
 use expensify::{
     ApiErrorKind, Client, Credentials, Error, ExportFormat, ExportTemplate, FileSystem, Json,
-    ReconciliationScope, ReconciliationTemplate, ReimburseTargets, ReportsQuery,
+    PolicyPlan, PolicyRole, PolicyTags, ReconciliationScope, ReconciliationTemplate,
+    ReimburseTargets, ReportFieldType, ReportsQuery,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -483,6 +484,108 @@ async fn empty_tax_object_is_none_not_an_error() {
     assert!(policies[&id].tax.is_none());
 }
 
+/// Expensify's documented sample returns `tags` flat for one policy and
+/// level-wrapped for another. Before both shapes were modelled, the second
+/// one failed the whole call and discarded the first policy's data.
+#[tokio::test]
+async fn policy_getter_accepts_both_tag_shapes_in_one_call() {
+    let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
+        "responseCode": 200,
+        "policyInfo": {
+            "FLAT": { "tags": [{ "glCode": "", "name": "Enterprise", "enabled": true }] },
+            "LEVELS": { "tags": [{ "name": "Tags", "tags": [] }] }
+        }
+    })))
+    .await;
+
+    let flat = expensify::PolicyId::new("FLAT");
+    let levels = expensify::PolicyId::new("LEVELS");
+    let policies = client(&server)
+        .get_policies([&flat, &levels])
+        .with_tags()
+        .await
+        .expect("a level-wrapped policy must not poison the whole call");
+
+    match &policies[&flat].tags {
+        PolicyTags::Flat(tags) => assert_eq!(tags[0].name, "Enterprise"),
+        other => panic!("expected a flat list, got {other:?}"),
+    }
+    match &policies[&levels].tags {
+        PolicyTags::Levels(levels) => {
+            assert_eq!(levels[0].name.as_deref(), Some("Tags"));
+            assert!(levels[0].tags.is_empty());
+        }
+        other => panic!("expected levels, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn policy_getter_reads_report_fields_and_employees() {
+    let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
+        "responseCode": 200,
+        "policyInfo": {
+            "P1": {
+                "reportFields": [
+                    { "name": "Title", "type": "formula", "values": [] },
+                    { "name": "Cost Center", "type": "dropdown", "values": ["Ops", "Eng"] }
+                ],
+                "employees": [
+                    { "email": "user@acme.com", "role": "admin",
+                      "submitsTo": "boss@acme.com", "employeeID": "42" }
+                ]
+            }
+        }
+    })))
+    .await;
+
+    let id = expensify::PolicyId::new("P1");
+    let policies = client(&server)
+        .get_policies([&id])
+        .with_report_fields()
+        .with_employees()
+        .await
+        .unwrap();
+
+    let policy = &policies[&id];
+    assert_eq!(policy.report_fields[0].field_type, ReportFieldType::Formula);
+    assert_eq!(policy.report_fields[1].values, ["Ops", "Eng"]);
+    assert_eq!(policy.employees[0].role, PolicyRole::Admin);
+    assert_eq!(policy.employees[0].employee_id.as_deref(), Some("42"));
+
+    let requests = server.received_requests().await.unwrap();
+    let input = &job(&requests[0]).unwrap()["inputSettings"];
+    assert_eq!(input["fields"], json!(["reportFields", "employees"]));
+}
+
+/// `PolicySummary`'s renames (`type` -> plan, `outputCurrency`) are only
+/// exercised here, and one policy on an unmodelled plan must not fail the
+/// list.
+#[tokio::test]
+async fn policy_list_decodes_summaries_including_unknown_plans() {
+    let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
+        "responseCode": 200,
+        "policyList": [
+            { "id": "P1", "name": "Ops", "owner": "boss@acme.com",
+              "role": "admin", "outputCurrency": "USD", "type": "corporate" },
+            { "id": "P2", "name": "Personal", "owner": "me@acme.com",
+              "role": "user", "outputCurrency": "GBP", "type": "personalPolicy" }
+        ]
+    })))
+    .await;
+
+    let policies = client(&server).list_policies().admin_only().await.unwrap();
+    assert_eq!(policies[0].id.as_str(), "P1");
+    assert_eq!(policies[0].plan, PolicyPlan::Corporate);
+    assert_eq!(policies[0].output_currency.as_str(), "USD");
+    assert_eq!(policies[1].plan, PolicyPlan::Other("personalPolicy".into()));
+    assert_eq!(policies[1].role, PolicyRole::User);
+
+    let requests = server.received_requests().await.unwrap();
+    let input = &job(&requests[0]).unwrap()["inputSettings"];
+    assert_eq!(input["type"], "policyList");
+    assert_eq!(input["adminOnly"], json!(true));
+}
+
 #[tokio::test]
 async fn missing_requested_section_is_a_decode_error() {
     let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -607,6 +710,172 @@ async fn report_fields_that_are_not_an_object_fail_at_await() {
 }
 
 #[tokio::test]
+async fn report_creator_returns_the_new_report() {
+    let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
+        "responseCode": 200,
+        "reportID": "R00bCluvcO4T",
+        "reportName": "July",
+    })))
+    .await;
+
+    let created = client(&server)
+        .create_report(
+            "P1",
+            "user@acme.com",
+            "July",
+            [expensify::ExpenseLine::new(
+                "Taxi",
+                date!(2026 - 07 - 04),
+                expensify::Money::new(2_50, "USD"),
+            )],
+        )
+        .report_field("Reason of trip!", "Business trip")
+        .await
+        .unwrap();
+
+    assert_eq!(created.report_id.as_str(), "R00bCluvcO4T");
+    assert_eq!(created.name, "July");
+
+    let input = &job(&server.received_requests().await.unwrap()[0]).unwrap()["inputSettings"];
+    assert_eq!(
+        input["report"]["fields"]["Reason_of_trip_"],
+        "Business trip"
+    );
+    assert_eq!(input["expenses"][0]["date"], "2026-07-04");
+}
+
+#[tokio::test]
+async fn expense_rules_round_trip() {
+    let server =
+        server_with(ResponseTemplate::new(200).set_body_json(json!({ "responseCode": 200 }))).await;
+
+    let client = client(&server);
+    client
+        .create_expense_rule("P1", "user@acme.com")
+        .tag("Core")
+        .await
+        .unwrap();
+    client
+        .update_expense_rule("P1", "user@acme.com", expensify::RuleId(4242))
+        .default_billable(false)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let create = job(&requests[0]).unwrap();
+    assert_eq!(create["type"], "create");
+    assert_eq!(create["inputSettings"]["actions"]["tag"], "Core");
+
+    let update = job(&requests[1]).unwrap();
+    assert_eq!(update["type"], "update");
+    assert_eq!(update["inputSettings"]["ruleID"], json!(4242));
+    assert_eq!(
+        update["inputSettings"]["actions"]["defaultBillable"],
+        json!(false)
+    );
+}
+
+#[tokio::test]
+async fn tag_approvers_send_the_clear_sentinel() {
+    let server =
+        server_with(ResponseTemplate::new(200).set_body_json(json!({ "responseCode": 200 }))).await;
+
+    client(&server)
+        .set_tag_approvers(
+            "P1",
+            [
+                expensify::TagApprover::assign("Engineering", "cto@acme.com"),
+                expensify::TagApprover::clear("Legal"),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let sent = job(&server.received_requests().await.unwrap()[0]).unwrap();
+    assert_eq!(sent["inputSettings"]["type"], "tagApprovers");
+    assert_eq!(sent["tagApprovers"][0]["approver"], "cto@acme.com");
+    assert_eq!(sent["tagApprovers"][1]["approver"], "");
+}
+
+// ---------------------------------------------------------------------------
+// requests rejected before they are sent
+// ---------------------------------------------------------------------------
+
+/// An empty iterator type-checks through every anchored constructor and
+/// produces exactly the filterless request Expensify answers 410 to. The
+/// type system cannot see it; the client refuses to send it.
+#[tokio::test]
+async fn empty_collections_never_reach_the_wire() {
+    let server =
+        server_with(ResponseTemplate::new(200).set_body_json(json!({ "responseCode": 200 }))).await;
+    let client = client(&server);
+    let no_ids: [&str; 0] = [];
+
+    let template = ExportTemplate::new("...");
+    let errors = vec![
+        client
+            .export_reports(&template, ReportsQuery::report_ids(no_ids))
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        client
+            .mark_reports_reimbursed(ReimburseTargets::report_ids(no_ids))
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        client
+            .get_policies(no_ids)
+            .with_tax()
+            .await
+            .map(|_| ())
+            .unwrap_err(),
+        client.update_policies(no_ids).await.unwrap_err(),
+    ];
+
+    for err in errors {
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing should have been sent"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// download discrimination
+// ---------------------------------------------------------------------------
+
+/// An envelope with no `responseCode` is still an envelope. Handing this
+/// back as file content writes Expensify's error text into the caller's
+/// export.
+#[tokio::test]
+async fn download_envelope_without_a_code_is_not_content() {
+    let server = server_with(ResponseTemplate::new(200).set_body_json(json!({
+        "responseMessage": "File not found",
+    })))
+    .await;
+
+    let file = expensify::ExportedFile::from_parts("missing.csv", FileSystem::IntegrationServer);
+    match client(&server).download(&file).await.unwrap_err() {
+        Error::Decode(_) => {}
+        other => panic!("expected Decode, got {other:?}"),
+    }
+}
+
+/// The likeliest shape of the undocumented "export not rendered yet"
+/// response. Reporting it as an empty success writes an empty export.
+#[tokio::test]
+async fn download_of_an_empty_body_is_an_error() {
+    let server = server_with(ResponseTemplate::new(200).set_body_string("")).await;
+
+    let file = expensify::ExportedFile::from_parts("pending.csv", FileSystem::IntegrationServer);
+    match client(&server).download(&file).await.unwrap_err() {
+        Error::Decode(_) => {}
+        other => panic!("expected Decode, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn non_success_http_without_an_envelope_surfaces_the_status() {
     let server = server_with(
         ResponseTemplate::new(502).set_body_string("<html><body>Bad Gateway</body></html>"),
@@ -646,4 +915,21 @@ async fn deprecated_csv_updater_uploads_multipart() {
     let body = String::from_utf8_lossy(&request.body);
     assert!(body.contains("requestJobDescription"));
     assert!(body.contains("email,manager"));
+    assert!(body.contains(r#""fileType":"csv""#), "{body}");
+}
+
+/// DESIGN.md promises every action and output is `Send`, which is what
+/// keeps them usable from a multi-threaded runtime. Phantoms are
+/// `PhantomData<fn() -> T>` precisely so this holds for any `F`.
+#[test]
+fn actions_and_futures_are_send() {
+    fn assert_send<T: Send>() {}
+
+    assert_send::<expensify::ExportReportsAction<Json<Vec<ReportRow>>>>();
+    assert_send::<expensify::DownloadAction<Json<Vec<ReportRow>>>>();
+    assert_send::<expensify::ReconcileAction<Json<Vec<ReportRow>>>>();
+    assert_send::<expensify::GetPoliciesAction<expensify::Fetched, expensify::Omitted>>();
+    assert_send::<expensify::ReimburseAction>();
+    assert_send::<expensify::ExportedFile<Json<Vec<ReportRow>>>>();
+    assert_send::<expensify::UpdateEmployeesAction>();
 }

@@ -1,9 +1,16 @@
 //! Policy data types shared between the getter (deserialized) and the
 //! updater (serialized).
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::types::{Currency, PolicyId, TaxRateId};
+
+/// Getter samples always carry `enabled`, but the updater tables list it as
+/// optional and both directions share these structs.
+fn enabled_by_default() -> bool {
+    true
+}
 
 /// A policy category. Read back by the Policy Getter; sent by the Policy
 /// Updater (same wire shape both ways).
@@ -12,7 +19,9 @@ use crate::types::{Currency, PolicyId, TaxRateId};
 pub struct Category {
     /// Category name, as shown in Expensify.
     pub name: String,
-    /// Whether the category can be selected on new expenses.
+    /// Whether the category can be selected on new expenses. Absent on the
+    /// wire means enabled.
+    #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     /// General-ledger code for accounting exports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,7 +101,9 @@ impl Category {
 pub struct PolicyTag {
     /// Tag name.
     pub name: String,
-    /// Whether the tag can be selected on new expenses.
+    /// Whether the tag can be selected on new expenses. Absent on the wire
+    /// means enabled.
+    #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     /// General-ledger code for accounting exports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,13 +133,109 @@ impl PolicyTag {
     }
 }
 
-/// Kind of a policy report field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One tag level as the Policy Getter returns it: a name plus the tags it
+/// contains.
+///
+/// This is the read-side counterpart of [`TagLevel`](crate::TagLevel).
+/// Expensify's getter sample carries only `name` and `tags`, so there is no
+/// "required" flag here even though the updater has one.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct PolicyTagLevel {
+    /// Level name, e.g. `"Tags"`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Tags in this level.
+    #[serde(default)]
+    pub tags: Vec<PolicyTag>,
+}
+
+/// Tags as the Policy Getter returns them.
+///
+/// Expensify answers with one of two shapes and does not say which to
+/// expect: a flat list of tags, or a list of tag *levels* each wrapping its
+/// own tags. Both appear in the same page of Expensify's own documentation,
+/// so both are modelled here rather than one being guessed at. Use
+/// [`PolicyTags::tags`] when the level structure does not matter.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum PolicyTags {
+    /// `[{"name":"Enterprise","enabled":true,"glCode":""}]` — a
+    /// single-level policy's tags, unwrapped.
+    Flat(Vec<PolicyTag>),
+    /// `[{"name":"Tags","tags":[...]}]` — one entry per tag level.
+    Levels(Vec<PolicyTagLevel>),
+}
+
+impl PolicyTags {
+    /// Every tag, flattened across levels.
+    pub fn tags(&self) -> impl Iterator<Item = &PolicyTag> {
+        let (flat, levels) = match self {
+            Self::Flat(tags) => (Some(tags), None),
+            Self::Levels(levels) => (None, Some(levels)),
+        };
+        flat.into_iter().flatten().chain(
+            levels
+                .into_iter()
+                .flatten()
+                .flat_map(|level| level.tags.iter()),
+        )
+    }
+}
+
+/// Hand-written rather than `#[serde(untagged)]`: the discriminator is the
+/// presence of a `tags` key on the elements, and untagged would report a
+/// genuine shape error as "did not match any variant".
+impl<'de> Deserialize<'de> for PolicyTags {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+        let level_wrapped = raw.iter().any(|entry| entry.get("tags").is_some());
+
+        if level_wrapped {
+            raw.into_iter()
+                .map(|entry| serde_json::from_value(entry).map_err(D::Error::custom))
+                .collect::<Result<Vec<PolicyTagLevel>, _>>()
+                .map(Self::Levels)
+        } else {
+            raw.into_iter()
+                .map(|entry| serde_json::from_value(entry).map_err(D::Error::custom))
+                .collect::<Result<Vec<PolicyTag>, _>>()
+                .map(Self::Flat)
+        }
+    }
+}
+
+/// Kind of a report field, as the Policy Getter reports it.
+///
+/// Open: Expensify owns this vocabulary and adds to it without notice, so
+/// an unrecognized value lands in [`ReportFieldType::Other`] instead of
+/// failing the whole policy read. The updater accepts a strictly narrower
+/// set — see [`ReportFieldDefType`].
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ReportFieldType {
-    /// Read-only: appears in getter output (e.g. the report title) but is
-    /// not creatable via the updater (server rejects it).
+    /// Computed server-side (e.g. the report title). Read-only: the updater
+    /// rejects it, which is why [`ReportFieldDefType`] has no such variant.
     Formula,
+    /// Free text.
+    Text,
+    /// Pick from [`ReportField::values`].
+    Dropdown,
+    /// Date picker.
+    Date,
+    /// A kind this crate does not model, verbatim from the wire.
+    #[serde(untagged)]
+    Other(String),
+}
+
+/// Kind of a report field the Policy Updater will accept.
+///
+/// Deliberately narrower than [`ReportFieldType`]: Expensify's updater
+/// documents exactly these three and rejects `formula`, so that value is
+/// not representable on a [`ReportFieldDef`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportFieldDefType {
     /// Free text.
     Text,
     /// Pick from [`ReportFieldDef::values`].
@@ -157,9 +264,9 @@ pub struct ReportField {
 pub struct ReportFieldDef {
     /// Field label.
     pub name: String,
-    /// Field kind. [`ReportFieldType::Formula`] is rejected by the server.
+    /// Field kind.
     #[serde(rename = "type")]
-    pub field_type: ReportFieldType,
+    pub field_type: ReportFieldDefType,
     /// Always serialized in object form; Expensify's "uniformly strings or
     /// uniformly objects" rule is therefore satisfied by construction.
     pub values: Vec<ReportFieldValue>,
@@ -170,7 +277,7 @@ pub struct ReportFieldDef {
 
 impl ReportFieldDef {
     /// No values, no default.
-    pub fn new(name: impl Into<String>, field_type: ReportFieldType) -> Self {
+    pub fn new(name: impl Into<String>, field_type: ReportFieldDefType) -> Self {
         Self {
             name: name.into(),
             field_type,
@@ -270,8 +377,13 @@ pub struct TaxRate {
 }
 
 /// A member's role on a policy.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Open: Expensify owns this vocabulary, and one member with an unmodelled
+/// role must not fail the whole read. [`PolicyRole::Other`] exists for the
+/// read direction; sending one is a server-side rejection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum PolicyRole {
     /// Submits expenses.
     User,
@@ -279,6 +391,9 @@ pub enum PolicyRole {
     Auditor,
     /// Full policy administration.
     Admin,
+    /// A role this crate does not model, verbatim from the wire.
+    #[serde(untagged)]
+    Other(String),
 }
 
 /// Policy member (Policy Getter, `fields: ["employees"]`).
@@ -305,13 +420,21 @@ pub struct PolicyEmployee {
 
 /// `type` on the wire; called "plan" here to avoid a third meaning of
 /// "type".
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Open: `free`, `control` and `personalPolicy` are all observed values
+/// that the Policy Creator does not document, and one such policy must not
+/// fail an entire [`Client::list_policies`](crate::Client::list_policies).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum PolicyPlan {
     /// Team plan (the server default for new policies).
     Team,
     /// Corporate plan.
     Corporate,
+    /// A plan this crate does not model, verbatim from the wire.
+    #[serde(untagged)]
+    Other(String),
 }
 
 /// One entry from the Policy List Getter.
@@ -331,4 +454,78 @@ pub struct PolicySummary {
     /// Subscription plan.
     #[serde(rename = "type")]
     pub plan: PolicyPlan,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Expensify's own single-policy sample shows tags in both shapes on
+    /// the same page; either must decode.
+    #[test]
+    fn tags_decode_flat_and_level_wrapped() {
+        let flat: PolicyTags = serde_json::from_value(
+            json!([{ "glCode": "", "name": "Enterprise", "enabled": true }]),
+        )
+        .unwrap();
+        assert!(matches!(&flat, PolicyTags::Flat(tags) if tags[0].name == "Enterprise"));
+
+        let levels: PolicyTags = serde_json::from_value(json!([
+            { "name": "Department", "tags": [{ "name": "Eng", "enabled": true }] },
+            { "name": "Empty", "tags": [] }
+        ]))
+        .unwrap();
+        match &levels {
+            PolicyTags::Levels(levels) => {
+                assert_eq!(levels[0].name.as_deref(), Some("Department"));
+                assert!(levels[1].tags.is_empty());
+            }
+            other => panic!("expected levels, got {other:?}"),
+        }
+
+        // The reproducer from the review: a level with no tags and no
+        // `enabled` key used to fail the whole `get_policies` call.
+        let empty: PolicyTags =
+            serde_json::from_value(json!([{ "name": "Tags", "tags": [] }])).unwrap();
+        assert_eq!(empty.tags().count(), 0);
+        assert_eq!(flat.tags().count(), 1);
+        assert_eq!(levels.tags().count(), 1);
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_when_absent() {
+        let category: Category = serde_json::from_value(json!({ "name": "Meals" })).unwrap();
+        assert!(category.enabled);
+        let tag: PolicyTag = serde_json::from_value(json!({ "name": "Core" })).unwrap();
+        assert!(tag.enabled);
+    }
+
+    /// One policy on a plan this crate does not model must not fail the
+    /// whole list.
+    #[test]
+    fn unknown_enum_values_round_trip_verbatim() {
+        for raw in ["free", "control", "personalPolicy"] {
+            let plan: PolicyPlan = serde_json::from_value(json!(raw)).unwrap();
+            assert_eq!(plan, PolicyPlan::Other(raw.to_owned()));
+            assert_eq!(serde_json::to_value(&plan).unwrap(), json!(raw));
+        }
+        assert_eq!(
+            serde_json::from_value::<PolicyRole>(json!("copilot")).unwrap(),
+            PolicyRole::Other("copilot".to_owned())
+        );
+        assert_eq!(
+            serde_json::from_value::<ReportFieldType>(json!("currency")).unwrap(),
+            ReportFieldType::Other("currency".to_owned())
+        );
+        // Known values still map to their named variants.
+        assert_eq!(
+            serde_json::from_value::<PolicyPlan>(json!("team")).unwrap(),
+            PolicyPlan::Team
+        );
+        assert_eq!(
+            serde_json::from_value::<ReportFieldType>(json!("formula")).unwrap(),
+            ReportFieldType::Formula
+        );
+    }
 }

@@ -24,6 +24,13 @@ pub enum Error {
     #[error("expensify responseCode {}: {}", .0.code, .0.message.as_deref().unwrap_or("<no message>"))]
     Api(ApiError),
 
+    /// The request was rejected before it was sent, because Expensify
+    /// documents it as a 410. Empty collections are the whole population:
+    /// an export, reimbursement, or policy read whose only anchor is an
+    /// empty iterator serializes to an empty `filters`/`policyIDList`.
+    #[error("{0}")]
+    InvalidRequest(String),
+
     /// Non-success HTTP response whose body was not a recognizable
     /// Expensify JSON envelope.
     #[error("HTTP {status}")]

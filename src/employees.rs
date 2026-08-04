@@ -3,6 +3,7 @@
 //! `employee-updater-deprecated` feature.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::BoxFuture;
 use crate::client::Client;
@@ -162,7 +163,10 @@ impl Employee {
 }
 
 /// Where Expensify gets the employee feed (`dataSource`).
-#[derive(Clone, Debug)]
+///
+/// [`fmt::Debug`] redacts the feed password, as
+/// [`Credentials`](crate::Credentials) and [`SftpConnection`] do.
+#[derive(Clone)]
 pub enum EmployeeSource {
     /// Feed sent inline in the request (`dataSource: "request"`).
     Inline(Vec<Employee>),
@@ -172,7 +176,7 @@ pub enum EmployeeSource {
         url: String,
         /// Basic-auth user, if the URL needs one.
         user: Option<String>,
-        /// Basic-auth password.
+        /// Basic-auth password. Never printed by [`fmt::Debug`].
         password: Option<String>,
     },
     /// Expensify fetches the feed over SFTP (`dataSource: "sftp"`).
@@ -182,6 +186,32 @@ pub enum EmployeeSource {
         /// Feed filename relative to the SFTP user's home directory.
         filename: String,
     },
+}
+
+impl fmt::Debug for EmployeeSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline(employees) => f.debug_tuple("Inline").field(employees).finish(),
+            Self::FetchUrl {
+                url,
+                user,
+                password,
+            } => f
+                .debug_struct("FetchUrl")
+                .field("url", url)
+                .field("user", user)
+                .field("password", &password.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::Sftp {
+                connection,
+                filename,
+            } => f
+                .debug_struct("Sftp")
+                .field("connection", connection)
+                .field("filename", filename)
+                .finish(),
+        }
+    }
 }
 
 /// `setEmployeePrimaryPolicy`.
@@ -337,5 +367,47 @@ impl IntoFuture for UpdateEmployeesCsvAction {
             let response = self.client.send(request).await?;
             wire::nb_employees(response)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_the_feed_password() {
+        let source = EmployeeSource::FetchUrl {
+            url: "https://hr.acme.com/feed.json".into(),
+            user: Some("hr".into()),
+            password: Some("hunter2-super-secret".into()),
+        };
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("hr.acme.com"), "{rendered}");
+
+        // No password, nothing to hide.
+        let anonymous = EmployeeSource::FetchUrl {
+            url: "https://hr.acme.com/feed.json".into(),
+            user: None,
+            password: None,
+        };
+        assert!(!format!("{anonymous:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn debug_redacts_the_sftp_feed_password() {
+        let source = EmployeeSource::Sftp {
+            connection: SftpConnection {
+                host: "sftp.acme.com".into(),
+                login: "acme".into(),
+                password: "hunter2-super-secret".into(),
+                port: 22,
+            },
+            filename: "employees.json".into(),
+        };
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+        assert!(rendered.contains("employees.json"), "{rendered}");
     }
 }

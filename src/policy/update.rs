@@ -173,6 +173,18 @@ pub struct TagsUpdate {
 impl TagsUpdate {
     /// Update/add the listed levels and tags, keep the rest. Independent
     /// levels only; the inline form has no dependency knob.
+    ///
+    /// # Warning: may be destructive
+    ///
+    /// Unverified. Expensify's inline-tags parameter table documents no
+    /// `action` key at all, and its prose says a tags update "**replaces**
+    /// the existing tags of the policy". If the server ignores the `action`
+    /// this crate sends, `merge_inline` deletes every tag not in `levels` —
+    /// exactly what the `replace_all_*` naming exists to make impossible to
+    /// do by accident. Until it is confirmed against a live account, treat
+    /// this as potentially equivalent to
+    /// [`replace_all_inline`](Self::replace_all_inline) and read the tags
+    /// back afterwards.
     pub fn merge_inline<I: IntoIterator<Item = TagLevel>>(levels: I) -> Self {
         Self {
             mode: UpdateMode::Merge,
@@ -190,6 +202,13 @@ impl TagsUpdate {
 
     /// Tag data uploaded in the separate `file` form field. Non-UTF-8 bytes
     /// are replaced, since the field is urlencoded text.
+    ///
+    /// # Warning: may be destructive
+    ///
+    /// Carries the same unverified risk as
+    /// [`merge_inline`](Self::merge_inline) — if Expensify ignores the
+    /// `action` key for tag updates, this replaces the policy's tags rather
+    /// than merging into them.
     pub fn merge_csv(data: impl Into<Bytes>, config: TagCsvConfig) -> Self {
         Self {
             mode: UpdateMode::Merge,
@@ -262,6 +281,13 @@ impl IntoFuture for UpdatePolicyAction {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
+            if self.policy_ids.is_empty() {
+                return Err(Error::InvalidRequest(
+                    "update_policies needs at least one policy ID; \
+                     an empty policyIDList is a documented 410"
+                        .to_owned(),
+                ));
+            }
             let request = wire::update_policy(&self);
             self.client.send(request).await?;
             Ok(())
