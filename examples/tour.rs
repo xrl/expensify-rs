@@ -1,7 +1,7 @@
 //! The design doc's running example: month-end close.
 //! Compiles against the skeleton; panics at runtime (bodies are stubs).
 
-use expensify_rs::{
+use expensify::{
     Client, Credentials, Expense, ExpenseTax, ExportTemplate, Json, Money, PolicyId, ReportId,
     ReportState, ReportsQuery, ReimburseTargets,
 };
@@ -22,7 +22,7 @@ const TEMPLATE_SRC: &str = r#"[<#list reports as report>
    "total_cents": ${report.total}}<#if report_has_next>,</#if>
 </#list>]"#;
 
-async fn month_end_close(client: &Client, policy: PolicyId) -> Result<(), expensify_rs::Error> {
+async fn month_end_close(client: &Client, policy: PolicyId) -> Result<(), expensify::Error> {
     // 1. Export July's approved reports, typed by the template.
     let template: ExportTemplate<Json<Vec<ReportRow>>> = ExportTemplate::typed(TEMPLATE_SRC);
 

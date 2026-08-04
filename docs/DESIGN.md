@@ -285,15 +285,11 @@ comma-joined), `.limit(u32)`, `.employee_email(..)` (doc: restricted),
 `.format(ExportFormat)`, `.file_basename(..)`,
 `.include_full_page_receipts_pdf()`, `.on_finish(OnFinish)` (repeatable),
 `.mark_as_exported(label)` (sugar for the common `OnFinish`),
-`.test_run()`. Default format: `Csv`; when the template marker is
-`Json<_>` the wire layer defaults `fileExtension` to `json` instead
-(implementer note: keyed off an optional
-`FromExport::PREFERRED_FORMAT`-style const is over-machinery — just
-special-case the default in the two action constructors is wrong too,
-since `F` is erased there; simplest correct move: leave the default `Csv`
-and document that typed-JSON users should call `.format(Json)`; revisit
-if it bites. The skeleton documents the setter; **the doc default is
-Csv**).
+`.test_run()`. Default format is `Csv` for every template marker,
+including `Json<_>` — deriving it from `F` would need an associated const
+on `FromExport`, which open question 5 rules on. Until then a
+`Json<_>` template must call `.format(ExportFormat::Json)`; the mismatch
+surfaces as a decode error, not silent corruption.
 
 `OnFinish` constructors: `mark_as_exported(label)`,
 `email(recipients).message(text)`, `sftp_upload(SftpConnection)`.
