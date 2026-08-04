@@ -48,7 +48,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: clippy-${{ matrix.name }}
-      - run: cargo clippy --locked --all-targets ${{ matrix.flags }} -- -D warnings
+      - run: cargo clippy --workspace --locked --all-targets ${{ matrix.flags }} -- -D warnings
 
   test:
     name: test (${{ matrix.name }})
@@ -71,7 +71,7 @@ jobs:
           key: test-${{ matrix.name }}
       # trybuild compares against committed rustc diagnostics, which drift
       # between releases; the `ui` job owns that check on a pinned toolchain.
-      - run: cargo test --locked ${{ matrix.flags }} -- --skip misuses_do_not_compile
+      - run: cargo test --workspace --locked ${{ matrix.flags }} -- --skip misuses_do_not_compile
 
   ui:
     name: trybuild (rustc 1.96.1)
@@ -85,7 +85,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ui
-      - run: cargo test --locked --all-features --test compile_fail
+      - run: cargo test --locked --all-features -p expensify --test compile_fail
 
   docs:
     name: rustdoc
@@ -100,8 +100,9 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: docs
-      # Matches the docs.rs build configured in Cargo.toml.
-      - run: cargo doc --locked --all-features --no-deps
+      # Matches the docs.rs build configured in Cargo.toml. Library only:
+      # the CLI is a binary, and its rustdoc output collides with the lib's.
+      - run: cargo doc --locked --all-features --no-deps -p expensify
 
   msrv:
     name: msrv (1.88)
@@ -115,9 +116,10 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: msrv
-      # Library only: `rust-version` is a promise to consumers, and dev
-      # dependencies are not part of it.
-      - run: cargo check --locked --all-features
+      # Library only: `rust-version` is a promise to consumers, and neither
+      # dev dependencies nor the CLI are part of it. (The CLI does build on
+      # 1.88 today; that is not a promise.)
+      - run: cargo check --locked --all-features -p expensify
 
   deny:
     name: cargo-deny
