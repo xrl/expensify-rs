@@ -140,8 +140,9 @@ is no equivalent here, and every claim the design makes about what *cannot* be
 expressed is worthless if nothing checks it — the first person to loosen a
 bound would silently undo it.
 
-So the design's list of misuses is executable. Each of the twelve entries in
+So the design's list of misuses is executable. Every entry in
 [`DESIGN.md` § Misuses made uncompilable](DESIGN.md#misuses-made-uncompilable)
-is a `trybuild` case with a committed `.stderr`. That suite is this crate's
-compliance test: it is the difference between "hard to hold wrong" as a design
-intention and as a property under test.
+is a `trybuild` case with a committed `.stderr`, and CI runs them on a pinned
+toolchain so the expectations can't rot. That suite is this crate's compliance
+test: it is the difference between "hard to hold wrong" as a design intention
+and as a property under test.

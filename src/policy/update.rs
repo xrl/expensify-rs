@@ -164,6 +164,13 @@ pub(crate) enum TagsSource {
 }
 
 /// Tag section of a Policy Updater request.
+///
+/// Replace-only, unlike [`CategoriesUpdate`] and [`ReportFieldsUpdate`]:
+/// Expensify's inline-tags parameter table documents no `action` key and its
+/// prose says a tags update "replaces the existing tags of the policy", so a
+/// `merge_*` constructor here could not be trusted to merge. A `merge` that
+/// may delete every unlisted tag is exactly what this crate's naming exists
+/// to prevent, so it is withheld until a live account confirms otherwise.
 #[derive(Clone, Debug)]
 pub struct TagsUpdate {
     pub(crate) mode: UpdateMode,
@@ -171,28 +178,8 @@ pub struct TagsUpdate {
 }
 
 impl TagsUpdate {
-    /// Update/add the listed levels and tags, keep the rest. Independent
-    /// levels only; the inline form has no dependency knob.
-    ///
-    /// # Warning: may be destructive
-    ///
-    /// Unverified. Expensify's inline-tags parameter table documents no
-    /// `action` key at all, and its prose says a tags update "**replaces**
-    /// the existing tags of the policy". If the server ignores the `action`
-    /// this crate sends, `merge_inline` deletes every tag not in `levels` —
-    /// exactly what the `replace_all_*` naming exists to make impossible to
-    /// do by accident. Until it is confirmed against a live account, treat
-    /// this as potentially equivalent to
-    /// [`replace_all_inline`](Self::replace_all_inline) and read the tags
-    /// back afterwards.
-    pub fn merge_inline<I: IntoIterator<Item = TagLevel>>(levels: I) -> Self {
-        Self {
-            mode: UpdateMode::Merge,
-            source: TagsSource::Inline(levels.into_iter().collect()),
-        }
-    }
-
     /// Replace the entire tag list from inline levels. Destructive.
+    /// Independent levels only; the inline form has no dependency knob.
     pub fn replace_all_inline<I: IntoIterator<Item = TagLevel>>(levels: I) -> Self {
         Self {
             mode: UpdateMode::ReplaceAll,
@@ -200,26 +187,10 @@ impl TagsUpdate {
         }
     }
 
-    /// Tag data uploaded in the separate `file` form field. Non-UTF-8 bytes
-    /// are replaced, since the field is urlencoded text.
-    ///
-    /// # Warning: may be destructive
-    ///
-    /// Carries the same unverified risk as
-    /// [`merge_inline`](Self::merge_inline) — if Expensify ignores the
-    /// `action` key for tag updates, this replaces the policy's tags rather
-    /// than merging into them.
-    pub fn merge_csv(data: impl Into<Bytes>, config: TagCsvConfig) -> Self {
-        Self {
-            mode: UpdateMode::Merge,
-            source: TagsSource::Csv {
-                data: data.into(),
-                config,
-            },
-        }
-    }
-
     /// Replace the entire tag list from a CSV/TSV upload. Destructive.
+    ///
+    /// The data rides in the separate `file` form field; non-UTF-8 bytes are
+    /// replaced, since that field is urlencoded text.
     pub fn replace_all_csv(data: impl Into<Bytes>, config: TagCsvConfig) -> Self {
         Self {
             mode: UpdateMode::ReplaceAll,

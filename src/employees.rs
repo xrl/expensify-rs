@@ -164,8 +164,9 @@ impl Employee {
 
 /// Where Expensify gets the employee feed (`dataSource`).
 ///
-/// [`fmt::Debug`] redacts the feed password, as
-/// [`Credentials`](crate::Credentials) and [`SftpConnection`] do.
+/// [`fmt::Debug`] redacts the feed password — and any `user:pass@` in the
+/// feed URL — as [`Credentials`](crate::Credentials) and [`SftpConnection`]
+/// do.
 #[derive(Clone)]
 pub enum EmployeeSource {
     /// Feed sent inline in the request (`dataSource: "request"`).
@@ -198,7 +199,9 @@ impl fmt::Debug for EmployeeSource {
                 password,
             } => f
                 .debug_struct("FetchUrl")
-                .field("url", url)
+                // `https://user:pass@host/feed.json` is a natural way to spell
+                // this, so the URL is a secret carrier like the rest.
+                .field("url", &crate::client::redact_userinfo(url))
                 .field("user", user)
                 .field("password", &password.as_ref().map(|_| "<redacted>"))
                 .finish(),
@@ -393,6 +396,19 @@ mod tests {
             password: None,
         };
         assert!(!format!("{anonymous:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn debug_redacts_userinfo_in_the_feed_url() {
+        let source = EmployeeSource::FetchUrl {
+            url: "https://hr:hunter2-super-secret@hr.acme.com/feed.json".into(),
+            user: None,
+            password: None,
+        };
+        let rendered = format!("{source:?}");
+        assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>@hr.acme.com"), "{rendered}");
+        assert!(rendered.contains("/feed.json"), "{rendered}");
     }
 
     #[test]

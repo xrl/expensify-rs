@@ -235,9 +235,10 @@ The library cannot check template *content* — the type records the
 caller's declared intent at the only point they think about it.
 
 ```rust
-#[derive(Clone/*manual*/, Serialize, Deserialize)]      // serde(bound = "") — phantom needs no bounds
+#[derive(Clone, Copy, Serialize, Deserialize)]             // plain data; no phantom, no bounds
 pub enum FileSystem { IntegrationServer, Reconciliation }  // renames: integrationServer/reconciliation
 
+#[derive(Serialize, Deserialize)] #[serde(bound = "")]  // the phantom needs no bounds on F
 pub struct ExportedFile<F = Bytes> { name: String, file_system: FileSystem, _out: PhantomData<fn() -> F> }
 impl<F> ExportedFile<F> {
     pub(crate) fn from_response(name: String, fs: FileSystem) -> Self;  // ONLY normal constructor
@@ -304,7 +305,7 @@ impl ReportsQuery {
 `ExportReportsAction<F>` setters: `.state(ReportState)` (repeatable →
 comma-joined), `.limit(u32)`, `.employee_email(..)` (doc: restricted),
 `.format(ExportFormat)`, `.file_basename(..)`,
-`.include_full_page_receipts_pdf()`, `.on_finish(OnFinish)` (repeatable),
+`.on_finish(impl Into<OnFinish>)` (repeatable),
 `.mark_as_exported(label)` (sugar for the common `OnFinish`),
 `.test_run()`. Default format is `Csv` for every template marker,
 including `Json<_>` — deriving it from `F` would need an associated const
@@ -313,7 +314,10 @@ on `FromExport`, which open question 5 rules on. Until then a
 surfaces as a decode error, not silent corruption.
 
 `OnFinish` constructors: `mark_as_exported(label)`,
-`email(recipients).message(text)`, `sftp_upload(SftpConnection)`.
+`email(recipients) -> EmailOnFinish` (`.message(text)`, `Into<OnFinish>`),
+`sftp_upload(SftpConnection)`. `message` lives on its own type because it
+is meaningful for no other action; on the shared `OnFinish` it was a setter
+that compiled and did nothing (misuse 17).
 `SftpConnection { host, login, password, port: u16 }` (Clone; public
 fields; shared with the employee updater's SFTP source). `Debug` is
 **manual and redacts `password`** — same rule as `Credentials`, and it
@@ -322,8 +326,10 @@ matters more here because `SftpConnection` is reachable from the `Debug` of
 
 `ReconcileAction<F>` (`DomainClient::reconcile`): required args carry
 `start`, `end`, `ReconciliationScope::{Unreported, All}`; setters
-`.feed(name)` (default: all feeds), `.format(..)` (Csv/Txt/Json/Xml only,
-server-validated), `.email_on_finish(recipients)`. `async` is not
+`.feed(name)` (default: all feeds), `.format(ReconciliationFormat)` — a
+separate four-variant enum, so the formats this job rejects are
+unrepresentable rather than server-rejected (misuse 18) —
+`.email_on_finish(recipients)`. `async` is not
 exposed — only `false` is supported upstream, so there is no parameter
 (rule 3 of the talk: delete parameters with one useful value).
 
@@ -514,12 +520,15 @@ Covered in [§ Exports](#exports-templates-files-download). Inventory:
 
 `ReportsQuery` (Clone, Debug), `ReportState` (Copy, Eq — Open, Submitted,
 Approved, Reimbursed, Archived), `ExportFormat` (Copy, Eq — Csv, Xls,
-Xlsx, Txt, Pdf, Json, Xml), `SftpConnection` (Clone, Debug, pub fields),
-`OnFinish` (Clone, Debug; private enum inside), `ExportReportsAction<F>`.
+Xlsx, Txt, Json, Xml; **no `Pdf`** — see open question 4),
+`SftpConnection` (Clone, Debug, pub fields), `OnFinish` (Clone, Debug;
+private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
+`ExportReportsAction<F>`.
 
 ### `reconciliation.rs`
 
-`ReconciliationScope` (Copy, Eq — Unreported, All), `ReconcileAction<F>`.
+`ReconciliationScope` (Copy, Eq — Unreported, All), `ReconciliationFormat`
+(Copy, Eq — Csv, Txt, Json, Xml), `ReconcileAction<F>`.
 
 ### `policy/` (flattened via `pub use` in `mod.rs`)
 
@@ -590,10 +599,10 @@ Xlsx, Txt, Pdf, Json, Xml), `SftpConnection` (Clone, Debug, pub fields),
   Expensify's rule that `setRequired` is scalar for dependent levels and
   per-level for independent ones (the wrong pairing is unrepresentable);
   `.with_gl_codes()`, `.with_header_row()`, `.tsv()`; `TagsUpdate` —
-  `merge_inline` / `replace_all_inline` (independent levels only — the
-  inline form simply has no dependency knob, matching the API) and
-  `merge_csv(data, config)` / `replace_all_csv` (the CSV goes in the
-  `file` form field); `UpdatePolicyAction` — `.categories()`,
+  `replace_all_inline` (independent levels only — the inline form simply
+  has no dependency knob, matching the API) and `replace_all_csv(data,
+  config)` (the CSV goes in the `file` form field), **replace-only** while
+  open question 9 is unresolved; `UpdatePolicyAction` — `.categories()`,
   `.report_fields()`, `.tags()`, each optional and independent.
 - `approvers.rs` — `TagApprover::assign(tag, email)` /
   `TagApprover::clear(tag)` (clearing is an explicit constructor, not the
@@ -650,7 +659,12 @@ documents no response body for these jobs.
   `FetchUrl { url, user, password }` (`"download"`),
   `Sftp { connection: SftpConnection, filename }` (`"sftp"`). An enum,
   not typestate: three mutually exclusive wire shapes, no sequencing.
-  Clone; `Debug` is manual and redacts the feed password.
+  Clone; `Debug` is manual and redacts the feed password *and* any
+  `user:pass@` in the feed URL — `https://user:pass@host/feed.json` is a
+  natural way to spell a basic-auth feed, so the URL is a secret carrier
+  too. Same treatment on `Client`'s `Debug` for a caller-set `base_url`
+  (`url::Url`'s own `Debug` prints `password` verbatim). Host and path
+  survive both, which is why the URL is printed at all.
 - `PrimaryPolicyMode` — None, NewEmployees, AllEmployees.
 - `UpdateEmployeesAction` — `.dry_run()`, `.primary_policy(mode)`,
   `.no_approval_chain_fixes()` (server default on),
@@ -730,21 +744,21 @@ src/
   types.rs          # id newtypes, Currency, Money
   template.rs       # FromExport, Json, ExportTemplate, ReconciliationTemplate
   file.rs           # FileSystem, ExportedFile, DownloadAction
-  export.rs         # ReportsQuery, ReportState, ExportFormat, OnFinish, SftpConnection, ExportReportsAction
-  reconciliation.rs # ReconciliationScope, ReconcileAction
+  export.rs         # ReportsQuery, ReportState, ExportFormat, OnFinish, EmailOnFinish, SftpConnection, ExportReportsAction
+  reconciliation.rs # ReconciliationScope, ReconciliationFormat, ReconcileAction
   policy/           # mod, model, get, list, create, update, approvers
   expenses.rs       # Expense, ExpenseTax, CreateExpensesAction, CreatedTransaction
   reports.rs        # ExpenseLine, CreateReportAction, ReimburseTargets/Action/Outcome
   expense_rules.rs
   employees.rs      # advanced updater + deprecated (feature)
   cards.rs          # DomainCard, DomainCardListAction
-  wire.rs, limit.rs # private (to be created by the implementer)
+  wire.rs, limit.rs # private: envelope assembly/parsing, rate-limit plumbing
 ```
 
 ## Misuses made uncompilable
 
-All verified against the skeleton (temporary `examples/misuse.rs`; error
-classes quoted from rustc).
+Each entry is a `trybuild` case under `tests/ui/` with a committed
+`.stderr`; error classes below are quoted from rustc.
 
 1. **Wrong `fileSystem` for a filename.** The classic: reconciliation
    filename + default `integrationServer` download = 404/garbage.
@@ -811,12 +825,26 @@ classes quoted from rustc).
     `extract`'s contract.
 16. **Reconciliation template fed to the exporter** — the reverse of case
     3; E0308, expected `&ExportTemplate<_>`.
+17. **An `onFinish` message on an action that has none.** `message` is
+    carried only by the email action, so on any other one it would compile
+    and be dropped: `OnFinish::mark_as_exported("x").message("y")` — E0599.
+    `OnFinish::email` returns `EmailOnFinish`, which is where `message`
+    lives; `on_finish` takes `impl Into<OnFinish>`.
+18. **An exporter-only format on the reconciliation job** (which accepts
+    only csv/txt/json/xml): `.format(ExportFormat::Xlsx)` — E0308, the
+    setter takes the narrower `ReconciliationFormat`. Same split as case 13.
 
 Runtime-but-loud (not compile errors, by design): empty collections are
 `Error::InvalidRequest` before anything is sent (case 7); destructive tag/
 category replacement is spelled `replace_all_*`; clearing a tag approver
 is `TagApprover::clear`, not an empty string; every action is
 `#[must_use]`.
+
+Two operations are **withheld** rather than made uncompilable, because the
+misuse is the server's behaviour and not a spelling: `TagsUpdate`'s
+`merge_*` constructors (open question 9) and `ExportFormat::Pdf` (open
+question 4). Both ship absent; adding either back once a live probe settles
+it is additive, not a breaking change.
 
 ## Naming divergences from the wire
 
@@ -883,9 +911,18 @@ is `TagApprover::clear`, not an empty string; every action is
    Probe with live credentials.
 4. **PDF exports** (`fileExtension: "pdf"`, one file *per report*): the
    interaction with `returnRandomFileName` (one name vs many) is
-   undocumented. Excluded from the typed path implicitly (nothing stops
-   `.format(Pdf)`, but the single-`ExportedFile` model may be wrong for
-   it). May need `Vec<ExportedFile>` output or a documented restriction.
+   undocumented, and one `ExportedFile` cannot name several files.
+
+   **Decided in the meantime:** `ExportFormat` has no `Pdf` variant. An
+   exporter that hands back one handle for forty PDFs is silent partial
+   data loss — the caller downloads one file and believes they have all
+   forty — which is the failure class this crate exists to prevent, and it
+   cannot be prevented by a doc comment on a variant that type-checks.
+   `includeFullPageReceiptsPdf` goes with it: the parameter table says it
+   "is used only if `fileExtension` contains `pdf`", so with PDF withheld
+   the setter could only ever be a no-op. A live probe of the response
+   shape decides whether this returns as `Vec<ExportedFile>` or as a
+   plain variant.
 5. **`ExportFormat` default for `Json<_>` templates** — doc'd default is
    Csv for all; auto-defaulting typed-JSON exports to `json` needs an
    associated const on `FromExport` (small trait wart). Rule on whether
@@ -909,10 +946,14 @@ is `TagApprover::clear`, not an empty string; every action is
 9. **Whether `action` is honoured for tag updates.** The inline-tags
    table documents no `action` key and the prose says a tags update
    "replaces the existing tags of the policy". If `action: "merge"` is
-   ignored, `TagsUpdate::merge_inline` / `merge_csv` are destructive —
-   the exact failure the `replace_all_*` naming exists to prevent. Both
-   methods carry a loud rustdoc warning; the naming cannot be fixed
-   blind. Highest-consequence of the unresolved five.
+   ignored, a `TagsUpdate::merge_*` would be destructive — the exact
+   failure the `replace_all_*` naming exists to prevent.
+
+   **Decided in the meantime:** `TagsUpdate` ships replace-only. A method
+   named `merge` that may delete every unlisted tag fails this crate's bar
+   however loud its doc comment is, and `replace_all_inline` /
+   `replace_all_csv` are honest under either server behaviour. Merge
+   returns if a live account confirms `action` is read.
 10. **Whether a partial reimbursement is always a 207.** The docs say
     non-Approved reports "will be ignored", without saying under which
     code. If a run can ignore reports under a plain 200, the strict

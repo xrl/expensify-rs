@@ -117,7 +117,17 @@ pub enum ReportState {
 }
 
 /// `outputSettings.fileExtension`.
+///
+/// No `Pdf`: Expensify emits one PDF *per report*, and one
+/// [`ExportedFile`] cannot name several files. A caller who asked for a PDF
+/// export of forty reports would download one and believe they had forty.
+/// Withheld until a live probe characterizes the response (DESIGN.md open
+/// question 4); adding it later is additive.
+///
+/// `#[non_exhaustive]` so reinstating `Pdf` stays additive for callers who
+/// `match` on this, not just for callers who construct it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExportFormat {
     /// Comma-separated values (the server default).
     Csv,
@@ -127,9 +137,6 @@ pub enum ExportFormat {
     Xlsx,
     /// Plain text.
     Txt,
-    /// PDF — note that Expensify emits one file *per report*, which this
-    /// crate's single-[`ExportedFile`] model does not represent.
-    Pdf,
     /// JSON; pair with a [`Json`](crate::Json) template marker.
     Json,
     /// XML.
@@ -195,22 +202,13 @@ impl OnFinish {
         }
     }
 
-    /// Comma-separate multiple recipients (wire format).
-    pub fn email(recipients: impl Into<String>) -> Self {
-        Self {
-            kind: OnFinishKind::Email {
-                recipients: recipients.into(),
-                message: None,
-            },
+    /// Comma-separate multiple recipients (wire format). Returns the one
+    /// variant that carries a message body.
+    pub fn email(recipients: impl Into<String>) -> EmailOnFinish {
+        EmailOnFinish {
+            recipients: recipients.into(),
+            message: None,
         }
-    }
-
-    /// Only meaningful on [`OnFinish::email`].
-    pub fn message(mut self, message: impl Into<String>) -> Self {
-        if let OnFinishKind::Email { message: m, .. } = &mut self.kind {
-            *m = Some(message.into());
-        }
-        self
     }
 
     /// Upload the rendered file to an SFTP server. The destination folder
@@ -218,6 +216,35 @@ impl OnFinish {
     pub fn sftp_upload(connection: SftpConnection) -> Self {
         Self {
             kind: OnFinishKind::SftpUpload(connection),
+        }
+    }
+}
+
+/// The `email` `onFinish` action, mid-build. Its own type because `message`
+/// is meaningful for no other action, and a setter that silently does
+/// nothing is the misuse this crate refuses to compile.
+#[derive(Clone, Debug)]
+#[must_use = "an onFinish action does nothing until it is passed to `on_finish`"]
+pub struct EmailOnFinish {
+    recipients: String,
+    message: Option<String>,
+}
+
+impl EmailOnFinish {
+    /// Body text for the notification email.
+    pub fn message(mut self, message: impl Into<String>) -> Self {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+impl From<EmailOnFinish> for OnFinish {
+    fn from(email: EmailOnFinish) -> Self {
+        Self {
+            kind: OnFinishKind::Email {
+                recipients: email.recipients,
+                message: email.message,
+            },
         }
     }
 }
@@ -237,7 +264,6 @@ pub struct ExportReportsAction<F> {
     pub(crate) employee_email: Option<String>,
     pub(crate) format: Option<ExportFormat>,
     pub(crate) file_basename: Option<String>,
-    pub(crate) include_full_page_receipts_pdf: bool,
     pub(crate) on_finish: Vec<OnFinish>,
     pub(crate) test: bool,
     _out: PhantomData<fn() -> F>,
@@ -254,7 +280,6 @@ impl<F> ExportReportsAction<F> {
             employee_email: None,
             format: None,
             file_basename: None,
-            include_full_page_receipts_pdf: false,
             on_finish: Vec::new(),
             test: false,
             _out: PhantomData,
@@ -299,15 +324,9 @@ impl<F> ExportReportsAction<F> {
         self
     }
 
-    /// PDF exports only: embed full-page receipt images.
-    pub fn include_full_page_receipts_pdf(mut self) -> Self {
-        self.include_full_page_receipts_pdf = true;
-        self
-    }
-
     /// Append an `onFinish` action; repeatable.
-    pub fn on_finish(mut self, action: OnFinish) -> Self {
-        self.on_finish.push(action);
+    pub fn on_finish(mut self, action: impl Into<OnFinish>) -> Self {
+        self.on_finish.push(action.into());
         self
     }
 

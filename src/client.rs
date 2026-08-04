@@ -53,6 +53,31 @@ impl fmt::Debug for Credentials {
     }
 }
 
+/// Replace a URL's `user:pass@` with `<redacted>@`, keeping scheme, host and
+/// path — the parts a printed URL is printed for.
+///
+/// Hand-rolled rather than via `Url`: the inputs are caller-supplied strings
+/// that may not parse, and `url::Url`'s own `Debug` prints the password.
+pub(crate) fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
+    };
+    let authority = scheme_end + 3;
+    let authority_end = url[authority..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |offset| authority + offset);
+    match url[authority..authority_end].rfind('@') {
+        None => url.to_owned(),
+        Some(at) => {
+            let mut redacted = String::with_capacity(url.len());
+            redacted.push_str(&url[..authority]);
+            redacted.push_str("<redacted>@");
+            redacted.push_str(&url[authority + at + 1..]);
+            redacted
+        }
+    }
+}
+
 pub(crate) struct RateGate {
     pub(crate) per_10s: governor::DefaultDirectRateLimiter,
     pub(crate) per_60s: governor::DefaultDirectRateLimiter,
@@ -275,7 +300,9 @@ impl Client {
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client")
-            .field("base_url", &self.inner.base_url)
+            // `Url`'s own Debug prints `password` verbatim, and a caller-set
+            // `base_url` may carry one.
+            .field("base_url", &redact_userinfo(self.inner.base_url.as_str()))
             .field("credentials", &self.inner.credentials)
             .finish()
     }
@@ -392,5 +419,34 @@ mod tests {
         let client = Client::new(Credentials::new("partner-id", "hunter2-super-secret"));
         let rendered = format!("{client:?}");
         assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+    }
+
+    #[test]
+    fn client_debug_redacts_base_url_userinfo() {
+        let client = Client::builder(Credentials::new("partner-id", "s3cret"))
+            .base_url(
+                "https://proxy:hunter2-super-secret@gw.acme.com/expensify"
+                    .parse()
+                    .unwrap(),
+            )
+            .build();
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains("hunter2-super-secret"), "{rendered}");
+        assert!(rendered.contains("<redacted>@gw.acme.com"), "{rendered}");
+        assert!(rendered.contains("/expensify"), "{rendered}");
+    }
+
+    #[test]
+    fn redaction_keeps_the_debuggable_half() {
+        assert_eq!(
+            redact_userinfo("https://hr:pw@acme.com/feed.json?x=1"),
+            "https://<redacted>@acme.com/feed.json?x=1"
+        );
+        // An `@` in the path is not userinfo.
+        assert_eq!(
+            redact_userinfo("https://acme.com/feed@latest.json"),
+            "https://acme.com/feed@latest.json"
+        );
+        assert_eq!(redact_userinfo("not a url"), "not a url");
     }
 }
