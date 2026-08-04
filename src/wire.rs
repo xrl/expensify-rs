@@ -380,13 +380,13 @@ fn api_error(code: u16, map: &Map<String, Value>, headers: &HeaderMap) -> Error 
 /// Body `responseCode` first, HTTP status only as a fallback.
 fn parse_envelope(status: StatusCode, headers: &HeaderMap, body: &Bytes) -> Result<Value, Error> {
     let parsed = serde_json::from_slice::<Value>(body);
-    if let Ok(Value::Object(map)) = &parsed {
-        if let Some(code) = response_code(map) {
-            return match code {
-                200 | 207 => Ok(parsed.expect("checked above")),
-                code => Err(api_error(code, map, headers)),
-            };
-        }
+    if let Ok(Value::Object(map)) = &parsed
+        && let Some(code) = response_code(map)
+    {
+        return match code {
+            200 | 207 => Ok(parsed.expect("checked above")),
+            code => Err(api_error(code, map, headers)),
+        };
     }
 
     if status == StatusCode::TOO_MANY_REQUESTS {
