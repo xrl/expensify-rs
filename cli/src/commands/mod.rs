@@ -7,6 +7,7 @@ mod download;
 mod export;
 mod get;
 mod reimburse;
+mod skill;
 mod update;
 
 use anyhow::{Context, Result};
@@ -26,6 +27,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Update { command } => update::run(command, &global).await,
         Command::Reimburse(args) => reimburse::run(args, &global).await,
         Command::Completion(args) => completion::run(args),
+        Command::Skill { command } => skill::run(command, &global),
     }
 }
 
