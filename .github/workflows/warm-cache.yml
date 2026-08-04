@@ -11,10 +11,7 @@ name: warm-cache
 # off the 10 GB cache ceiling, which PR-side saves had already pushed us to.
 on:
   push:
-    # TEMPORARY (revert before merge): a workflow_dispatch is only routable once
-    # the file is on the default branch, so warming this branch to measure
-    # cold-vs-warm has to come through a push trigger.
-    branches: [main, ci-build-caching]
+    branches: [main]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
