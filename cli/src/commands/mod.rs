@@ -11,7 +11,7 @@ mod skill;
 mod update;
 
 use anyhow::{Context, Result};
-use expensify::{Client, Credentials};
+use expensify::{Client, Credentials, Url};
 
 use crate::auth::{Keychain, ProcessEnv, resolve};
 use crate::cli::{Cli, Command, GlobalArgs};
@@ -50,10 +50,7 @@ pub fn client(global: &GlobalArgs) -> Result<Client> {
         resolved.partner_user_secret,
     ));
     if let Some(endpoint) = &global.endpoint {
-        // `ClientBuilder::base_url` takes a `reqwest::Url`, which is a
-        // re-export of `url::Url`.
-        let url =
-            url::Url::parse(endpoint).with_context(|| format!("`{endpoint}` is not a URL"))?;
+        let url = Url::parse(endpoint).with_context(|| format!("`{endpoint}` is not a URL"))?;
         builder = builder.base_url(url);
     }
     if global.no_rate_limit {

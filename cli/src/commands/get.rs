@@ -1,13 +1,11 @@
 //! `expensify get` — the read side.
 //!
-//! `get policy` is where the library's field typestate meets runtime flags;
-//! see the `stage_*` ladder below.
+//! `get policy` is where the library's field typestate meets runtime flags:
+//! the sections are `--with-*` flags, so the CLI takes the library's dynamic
+//! getter rather than the static one.
 
-use anyhow::{Context, Result, bail};
-use expensify::{
-    Category, FetchState, Fetched, GetPoliciesAction, GetPoliciesBuilder, NotFetched, Omitted,
-    Payload, PolicyEmployee, PolicyId, PolicyTags, ReportField, TaxConfig,
-};
+use anyhow::{Context, Result};
+use expensify::{DynamicPolicy, PolicyField, PolicyId, PolicyTags};
 use serde_json::{Value, json};
 
 use crate::cli::{
@@ -112,138 +110,57 @@ async fn cards(args: GetCardsArgs, global: &GlobalArgs) -> Result<()> {
 
 // ---- get policy: runtime flags over a compile-time typestate ---------
 
-/// A policy once its typestate has been read back into `Option`s. `None` is
-/// "not requested" — the library's `NotFetched`, which cannot be inspected
-/// generically.
+/// One policy plus its ID, so the output can be sorted and labelled.
 struct PolicyView {
     id: PolicyId,
-    categories: Option<Vec<Category>>,
-    report_fields: Option<Vec<ReportField>>,
-    tags: Option<PolicyTags>,
-    tax: Option<Option<TaxConfig>>,
-    employees: Option<Vec<PolicyEmployee>>,
+    sections: DynamicPolicy,
 }
 
-/// The inverse of [`FetchState::Wrap`], which the library does not provide:
-/// `Wrap` maps a payload into a slot, and nothing maps a slot back out. It
-/// is implementable outside the library only because both states and the
-/// GAT are public.
-trait Slot: FetchState {
-    fn read<T: Payload>(slot: Self::Wrap<T>) -> Option<T>;
-}
-
-impl Slot for Fetched {
-    fn read<T: Payload>(slot: T) -> Option<T> {
-        Some(slot)
-    }
-}
-
-impl Slot for Omitted {
-    fn read<T: Payload>(_slot: NotFetched) -> Option<T> {
-        None
-    }
-}
-
-/// Five stages, one per type parameter, each deciding its own flag and
-/// handing the next stage a more-`Fetched` action. Two branches per stage
-/// rather than one match over 32 states; the compiler still generates the
-/// 32 leaves.
-async fn stage_categories(
-    builder: GetPoliciesBuilder,
-    want: PolicySections,
-) -> Result<Vec<PolicyView>> {
-    // `GetPoliciesBuilder` cannot produce an all-`Omitted` action — the
-    // library requires at least one selection — so the first requested
-    // section anchors the chain.
+/// Exactly the sections the user asked for — nothing is requested to make
+/// the types line up. `--with-employees` and `--with-tax` need rights the
+/// credentials may not have, so an unasked-for section in this list can turn
+/// a working read into a 403.
+fn requested(want: PolicySections) -> Vec<PolicyField> {
+    let mut fields = Vec::new();
     if want.with_categories {
-        stage_report_fields(builder.with_categories(), want).await
-    } else if want.with_report_fields {
-        stage_tags(builder.with_report_fields(), want).await
-    } else if want.with_tags {
-        stage_tax(builder.with_tags(), want).await
-    } else if want.with_tax {
-        stage_employees(builder.with_tax(), want).await
-    } else if want.with_employees {
-        finish(builder.with_employees()).await
-    } else {
-        // clap's required group already refuses this.
-        bail!("select at least one --with-* section")
+        fields.push(PolicyField::Categories);
     }
-}
-
-async fn stage_report_fields<C: Slot>(
-    action: GetPoliciesAction<C, Omitted, Omitted, Omitted, Omitted>,
-    want: PolicySections,
-) -> Result<Vec<PolicyView>> {
     if want.with_report_fields {
-        stage_tags(action.with_report_fields(), want).await
-    } else {
-        stage_tags(action, want).await
+        fields.push(PolicyField::ReportFields);
     }
-}
-
-async fn stage_tags<C: Slot, F: Slot>(
-    action: GetPoliciesAction<C, F, Omitted, Omitted, Omitted>,
-    want: PolicySections,
-) -> Result<Vec<PolicyView>> {
     if want.with_tags {
-        stage_tax(action.with_tags(), want).await
-    } else {
-        stage_tax(action, want).await
+        fields.push(PolicyField::Tags);
     }
-}
-
-async fn stage_tax<C: Slot, F: Slot, T: Slot>(
-    action: GetPoliciesAction<C, F, T, Omitted, Omitted>,
-    want: PolicySections,
-) -> Result<Vec<PolicyView>> {
     if want.with_tax {
-        stage_employees(action.with_tax(), want).await
-    } else {
-        stage_employees(action, want).await
+        fields.push(PolicyField::Tax);
     }
-}
-
-async fn stage_employees<C: Slot, F: Slot, T: Slot, X: Slot>(
-    action: GetPoliciesAction<C, F, T, X, Omitted>,
-    want: PolicySections,
-) -> Result<Vec<PolicyView>> {
     if want.with_employees {
-        finish(action.with_employees()).await
-    } else {
-        finish(action).await
+        fields.push(PolicyField::Employees);
     }
-}
-
-async fn finish<C: Slot, F: Slot, T: Slot, X: Slot, E: Slot>(
-    action: GetPoliciesAction<C, F, T, X, E>,
-) -> Result<Vec<PolicyView>> {
-    let policies = action.await.context("reading policies")?;
-    let mut views: Vec<_> = policies
-        .into_iter()
-        .map(|(id, policy)| PolicyView {
-            id,
-            categories: C::read(policy.categories),
-            report_fields: F::read(policy.report_fields),
-            tags: T::read(policy.tags),
-            tax: X::read(policy.tax),
-            employees: E::read(policy.employees),
-        })
-        .collect();
-    // The response is a map; sort so output is stable between runs.
-    views.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-    Ok(views)
+    fields
 }
 
 async fn policy(args: GetPolicyArgs, global: &GlobalArgs) -> Result<()> {
     let client = client(global)?;
 
-    let mut builder = client.get_policies(args.policy_ids.iter().map(String::as_str));
+    // clap's required group guarantees a non-empty selection; the library
+    // rejects an empty one anyway.
+    let mut action = client.get_policies_dynamic(
+        args.policy_ids.iter().map(String::as_str),
+        requested(args.sections),
+    );
     if let Some(email) = &args.on_behalf_of {
-        builder = builder.on_behalf_of(email);
+        action = action.on_behalf_of(email);
     }
 
-    let policies = stage_categories(builder, args.sections).await?;
+    let mut policies: Vec<_> = action
+        .await
+        .context("reading policies")?
+        .into_iter()
+        .map(|(id, sections)| PolicyView { id, sections })
+        .collect();
+    // The response is a map; sort so output is stable between runs.
+    policies.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
 
     match global.output {
         OutputFormat::Json => {
@@ -260,25 +177,25 @@ async fn policy(args: GetPolicyArgs, global: &GlobalArgs) -> Result<()> {
 fn policy_json(policy: &PolicyView) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("id".into(), json!(policy.id.as_str()));
-    if let Some(categories) = &policy.categories {
+    if let Some(categories) = &policy.sections.categories {
         map.insert(
             "categories".into(),
             Value::Array(categories.iter().map(view::category).collect()),
         );
     }
-    if let Some(fields) = &policy.report_fields {
+    if let Some(fields) = &policy.sections.report_fields {
         map.insert(
             "report_fields".into(),
             Value::Array(fields.iter().map(view::report_field).collect()),
         );
     }
-    if let Some(tags) = &policy.tags {
+    if let Some(tags) = &policy.sections.tags {
         map.insert("tags".into(), view::tags(tags));
     }
-    if let Some(tax) = &policy.tax {
+    if let Some(tax) = &policy.sections.tax {
         map.insert("tax".into(), view::tax(tax));
     }
-    if let Some(employees) = &policy.employees {
+    if let Some(employees) = &policy.sections.employees {
         map.insert(
             "employees".into(),
             Value::Array(employees.iter().map(view::policy_employee).collect()),
@@ -289,7 +206,7 @@ fn policy_json(policy: &PolicyView) -> Value {
 
 fn print_policy_tables(policies: &[PolicyView]) {
     for policy in policies {
-        if let Some(categories) = &policy.categories {
+        if let Some(categories) = &policy.sections.categories {
             let rows = categories
                 .iter()
                 .map(|category| {
@@ -309,7 +226,7 @@ fn print_policy_tables(policies: &[PolicyView]) {
                 &rows,
             );
         }
-        if let Some(fields) = &policy.report_fields {
+        if let Some(fields) = &policy.sections.report_fields {
             let rows = fields
                 .iter()
                 .map(|field| {
@@ -327,7 +244,7 @@ fn print_policy_tables(policies: &[PolicyView]) {
                 &rows,
             );
         }
-        if let Some(tags) = &policy.tags {
+        if let Some(tags) = &policy.sections.tags {
             let rows = match tags {
                 PolicyTags::Flat(flat) => flat
                     .iter()
@@ -363,7 +280,7 @@ fn print_policy_tables(policies: &[PolicyView]) {
                 &rows,
             );
         }
-        if let Some(tax) = &policy.tax {
+        if let Some(tax) = &policy.sections.tax {
             let rows = match tax {
                 None => Vec::new(),
                 Some(config) => config
@@ -386,7 +303,7 @@ fn print_policy_tables(policies: &[PolicyView]) {
                 &rows,
             );
         }
-        if let Some(employees) = &policy.employees {
+        if let Some(employees) = &policy.sections.employees {
             let rows = employees
                 .iter()
                 .map(|employee| {
@@ -421,25 +338,40 @@ fn section(policy: &PolicyId, name: &str, headers: &[&str], rows: &[Vec<String>]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use expensify::{PolicyTag, TaxRate};
+    use expensify::{Category, PolicyTag, TaxConfig, TaxRate};
 
     fn view_with_sections() -> PolicyView {
         PolicyView {
             id: PolicyId::new("P1"),
-            categories: Some(vec![Category::new("Meals")]),
-            report_fields: None,
-            tags: Some(PolicyTags::Flat(vec![PolicyTag::new("Core")])),
-            tax: Some(Some(TaxConfig {
-                name: "VAT".into(),
-                default: "id_A".into(),
-                rates: vec![TaxRate {
-                    name: "Standard".into(),
-                    rate: 20.0,
-                    rate_id: "id_A".into(),
-                }],
-            })),
-            employees: None,
+            sections: DynamicPolicy {
+                categories: Some(vec![Category::new("Meals")]),
+                report_fields: None,
+                tags: Some(PolicyTags::Flat(vec![PolicyTag::new("Core")])),
+                tax: Some(Some(TaxConfig {
+                    name: "VAT".into(),
+                    default: "id_A".into(),
+                    rates: vec![TaxRate {
+                        name: "Standard".into(),
+                        rate: 20.0,
+                        rate_id: "id_A".into(),
+                    }],
+                })),
+                employees: None,
+            },
         }
+    }
+
+    /// The flags decide the wire request, so an unselected section is never
+    /// fetched — `--with-employees` on a credential without the rights is a
+    /// 403, and asking for it unbidden would break working reads.
+    #[test]
+    fn only_selected_sections_are_requested() {
+        let want = PolicySections {
+            with_tax: true,
+            ..PolicySections::default()
+        };
+        assert_eq!(requested(want), vec![PolicyField::Tax]);
+        assert_eq!(requested(PolicySections::default()), vec![]);
     }
 
     /// The point of the whole typestate: a section that was not requested
@@ -456,7 +388,7 @@ mod tests {
     #[test]
     fn a_policy_with_no_tax_configuration_renders_null_not_absent() {
         let mut policy = view_with_sections();
-        policy.tax = Some(None);
+        policy.sections.tax = Some(None);
         assert_eq!(policy_json(&policy)["tax"], Value::Null);
     }
 }

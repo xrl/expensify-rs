@@ -31,4 +31,3 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "fmt",
     "std",
 ] }
-url = "2.5.8"
