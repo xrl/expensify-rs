@@ -58,6 +58,7 @@ let file = client
             .policy_ids([&policy])
             .not_yet_exported_as("acme-etl"))
     .state(ReportState::Approved)
+    .format(ExportFormat::Json)                // required: default is Csv for every marker
     .mark_as_exported("acme-etl")
     .await?;                                   // -> ExportedFile<Json<Vec<ReportRow>>>
 
@@ -786,3 +787,9 @@ is `TagApprover::clear`, not an empty string; every action is
 6. **Rate-limit figures** — if the "50 jobs/minute" page resurfaces,
    confirm whether it's a separate *job-start* budget on top of the
    request budget; the limiter currently models requests only.
+7. **`test` flag encoding.** Sent as a JSON boolean, on the grounds that
+   § "Wire mapping notes" lists `limit` as the only string-serialized
+   quirk. The docs show `"test"` in prose without a literal. If the
+   exporter silently ignores a boolean, `.test_run()` is a no-op and
+   `onFinish` fires during what the caller believes is a dry run — the
+   highest-consequence unverified guess in the wire layer.
