@@ -8,6 +8,8 @@ on:
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
+  # The release workflows gate publishing on this suite.
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
