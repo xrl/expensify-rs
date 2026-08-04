@@ -1,14 +1,36 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Typed client for the Expensify Integration Server API.
+//!
+//! Design skeleton: signatures are authoritative, bodies are stubs.
+//! See docs/DESIGN.md.
+#![allow(dead_code, unused_variables)]
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod cards;
+mod client;
+mod employees;
+mod error;
+mod expense_rules;
+mod expenses;
+mod export;
+mod file;
+mod policy;
+mod reconciliation;
+mod reports;
+mod template;
+mod types;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use cards::*;
+pub use client::*;
+pub use employees::*;
+pub use error::*;
+pub use expense_rules::*;
+pub use expenses::*;
+pub use export::*;
+pub use file::*;
+pub use policy::*;
+pub use reconciliation::*;
+pub use reports::*;
+pub use template::*;
+pub use types::*;
+
+pub(crate) type BoxFuture<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
