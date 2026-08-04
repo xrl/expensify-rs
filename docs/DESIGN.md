@@ -485,8 +485,8 @@ static — so both getters call one private `fetch`, which validates, sends and
 splits the response into undecoded sections. The dynamic getter then decodes
 each requested section through `Fetched::extract`, the same hook the static
 one uses, so a section that was requested and did not come back is the same
-`DecodeError` on both. There is one request path, one wire-name table
-(`PolicyField::wire`), and one place to change when Expensify adds a section.
+`DecodeError` on both. There is one request path and one wire-name table
+(`PolicyField::wire`), which the `with_*` setters push into as well.
 
 `get_policies` stays the documented default; `get_policies_dynamic`'s rustdoc
 says outright that it reintroduces the `unwrap` and names the case it is for.
