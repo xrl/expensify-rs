@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- CLI: `expensify skill install` writes the Claude Code agent skill embedded in
+  the binary (`cli/skill/SKILL.md`) into a personal or repository-local skills
+  directory. The library is unchanged.
+
 ## 0.1.0 — 2026-08-04
 
 First release. Covers the Expensify Integration Server's export, download,

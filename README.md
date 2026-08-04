@@ -83,6 +83,12 @@ $ expensify export reports --template month-end.ftl --since 2026-07-01
 $ expensify download export_1234.csv -O july.csv
 ```
 
+`expensify skill install` writes a [Claude Code](https://claude.com/claude-code)
+agent skill for this CLI into `~/.claude/skills/expensify/` — `--project` for a
+repository-local `.claude/skills`, `--print` for stdout. The skill is compiled
+into the binary from [`cli/skill/SKILL.md`](cli/skill/SKILL.md), so installing
+needs neither a checkout nor a network.
+
 Credentials resolve from `--partner-user-id`/`--partner-user-secret`, then
 `EXPENSIFY_PARTNER_USER_ID`/`EXPENSIFY_PARTNER_USER_SECRET`, then the keychain —
 so CI keeps using environment variables without touching a keychain that isn't

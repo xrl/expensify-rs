@@ -125,6 +125,12 @@ pub enum Command {
 
     /// Print a shell completion script
     Completion(CompletionArgs),
+
+    /// Install the Claude Code agent skill bundled with this binary
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
 }
 
 // ---- auth -----------------------------------------------------------
@@ -727,6 +733,38 @@ pub struct CompletionArgs {
     /// Shell to generate a completion script for
     #[arg(value_name = "SHELL", value_enum)]
     pub shell: clap_complete::Shell,
+}
+
+// ---- skill ----------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Write the bundled skill into a Claude Code skills directory
+    #[command(
+        long_about = "Write the bundled skill into a Claude Code skills directory.\n\n\
+                      The skill is compiled into this binary, so installing needs no \
+                      checkout and no network. Nothing is overwritten without --force."
+    )]
+    Install(SkillInstallArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Install into ./.claude/skills instead of the personal directory
+    #[arg(long, conflicts_with = "skills_dir")]
+    pub project: bool,
+
+    /// Install into this skills directory, rather than a discovered one
+    #[arg(long, value_name = "DIR")]
+    pub skills_dir: Option<std::path::PathBuf>,
+
+    /// Replace an already-installed SKILL.md
+    #[arg(long)]
+    pub force: bool,
+
+    /// Write the skill to stdout and install nothing
+    #[arg(long, conflicts_with_all = ["project", "skills_dir", "force"])]
+    pub print: bool,
 }
 
 // ---- value enums ----------------------------------------------------
