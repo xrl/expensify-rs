@@ -37,8 +37,8 @@ use crate::export::{
 };
 use crate::file::FileSystem;
 use crate::policy::{
-    CreatedPolicy, ListPoliciesAction, PolicyPlan, PolicySummary, SetTagApproversAction,
-    TagApprover, TagsSource, UpdateMode, UpdatePolicyAction,
+    CreatedPolicy, ListPoliciesAction, PolicyField, PolicyPlan, PolicySummary,
+    SetTagApproversAction, TagApprover, TagsSource, UpdateMode, UpdatePolicyAction,
 };
 use crate::reconciliation::{ReconcileAction, ReconciliationFormat, ReconciliationScope};
 use crate::reports::{
@@ -694,12 +694,15 @@ pub(crate) fn policy_list(value: Value) -> Result<Vec<PolicySummary>, Error> {
 
 pub(crate) fn get_policies(
     ids: &[PolicyId],
-    fields: &[&'static str],
+    fields: &[PolicyField],
     user_email: Option<&str>,
 ) -> JobRequest {
     let mut input = Map::new();
     input.insert("type".to_owned(), json!("policy"));
-    input.insert("fields".to_owned(), json!(fields));
+    input.insert(
+        "fields".to_owned(),
+        json!(fields.iter().map(|field| field.wire()).collect::<Vec<_>>()),
+    );
     input.insert("policyIDList".to_owned(), json!(ids));
     opt!(input, "userEmail", user_email);
     JobRequest::new("get").input_settings(input)

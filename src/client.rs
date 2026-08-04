@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use time::Date;
 
+use crate::Url;
 use crate::cards::DomainCardListAction;
 use crate::employees::{EmployeeSource, UpdateEmployeesAction};
 use crate::expense_rules::{CreateExpenseRuleAction, UpdateExpenseRuleAction};
@@ -10,8 +11,8 @@ use crate::expenses::{CreateExpensesAction, Expense};
 use crate::export::{ExportReportsAction, ReportsQuery};
 use crate::file::{DownloadAction, ExportedFile};
 use crate::policy::{
-    CreatePolicyAction, GetPoliciesBuilder, ListPoliciesAction, SetTagApproversAction, TagApprover,
-    UpdatePolicyAction,
+    CreatePolicyAction, GetPoliciesBuilder, GetPoliciesDynamicAction, ListPoliciesAction,
+    PolicyField, SetTagApproversAction, TagApprover, UpdatePolicyAction,
 };
 use crate::reconciliation::{ReconcileAction, ReconciliationScope};
 use crate::reports::{CreateReportAction, ExpenseLine, ReimburseAction, ReimburseTargets, Strict};
@@ -86,7 +87,7 @@ pub(crate) struct RateGate {
 pub(crate) struct ClientInner {
     pub(crate) http: reqwest::Client,
     pub(crate) credentials: Credentials,
-    pub(crate) base_url: reqwest::Url,
+    pub(crate) base_url: Url,
     pub(crate) limiter: Option<RateGate>,
 }
 
@@ -150,6 +151,53 @@ impl Client {
         GetPoliciesBuilder::new(
             self.clone(),
             policy_ids.into_iter().map(Into::into).collect(),
+        )
+    }
+
+    /// Policy Getter with a **runtime** field selection — the escape hatch
+    /// from the typestate, for callers whose selection is data.
+    ///
+    /// [`Client::get_policies`] is the default and stays the recommendation:
+    /// it returns a [`Policy`](crate::Policy) whose sections are plain
+    /// fields, so there is nothing to unwrap and reading a section you did
+    /// not request does not compile. This method cannot offer that — the
+    /// selection is not known until run time — so every section of the
+    /// returned [`DynamicPolicy`](crate::DynamicPolicy) is an `Option`, and
+    /// the `unwrap` the typestate exists to eliminate comes back.
+    ///
+    /// Reach for it only when the field list genuinely arrives as data (CLI
+    /// flags, a config file, an RPC): writing the 32-way branch over `with_*`
+    /// by hand is worse than this. When the selection *is* in the source, use
+    /// [`Client::get_policies`].
+    ///
+    /// An empty `fields` list is rejected with
+    /// [`Error::InvalidRequest`](crate::Error::InvalidRequest) at `.await` —
+    /// the same rule the static path enforces at compile time by making
+    /// [`GetPoliciesBuilder`] unawaitable. Repeated fields are ignored.
+    ///
+    /// ```no_run
+    /// # async fn f(client: &expensify::Client, fields: Vec<expensify::PolicyField>)
+    /// #     -> Result<(), expensify::Error> {
+    /// let policies = client.get_policies_dynamic(["0123456789ABCDEF"], &fields).await?;
+    /// for (id, policy) in &policies {
+    ///     if let Some(categories) = &policy.categories {
+    ///         println!("{id}: {} categories", categories.len());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_policies_dynamic<I, F>(&self, policy_ids: I, fields: F) -> GetPoliciesDynamicAction
+    where
+        I: IntoIterator,
+        I::Item: Into<PolicyId>,
+        F: IntoIterator,
+        F::Item: Into<PolicyField>,
+    {
+        GetPoliciesDynamicAction::new(
+            self.clone(),
+            policy_ids.into_iter().map(Into::into).collect(),
+            fields.into_iter().map(Into::into).collect(),
         )
     }
 
@@ -312,14 +360,29 @@ impl fmt::Debug for Client {
 #[must_use = "builders do nothing until `build()` is called"]
 pub struct ClientBuilder {
     credentials: Credentials,
-    base_url: Option<reqwest::Url>,
+    base_url: Option<Url>,
     http: Option<reqwest::Client>,
     rate_limiting: bool,
 }
 
 impl ClientBuilder {
     /// Override the endpoint (testing / proxies).
-    pub fn base_url(mut self, url: reqwest::Url) -> Self {
+    ///
+    /// Spell the argument as [`expensify::Url`](crate::Url) — a re-export, so
+    /// this needs no `url` or `reqwest` dependency of your own:
+    ///
+    /// ```
+    /// # fn f() -> Result<(), Box<dyn std::error::Error>> {
+    /// use expensify::{Client, Credentials, Url};
+    ///
+    /// let client = Client::builder(Credentials::new("id", "secret"))
+    ///     .base_url(Url::parse("http://127.0.0.1:8080/expensify")?)
+    ///     .build();
+    /// # let _ = client;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn base_url(mut self, url: Url) -> Self {
         self.base_url = Some(url);
         self
     }
