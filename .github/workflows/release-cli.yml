@@ -28,6 +28,8 @@ jobs:
 
   publish:
     name: cargo publish
+    # Deliberately not `needs: binaries`: crates.io is the release, and a
+    # runner outage on one architecture must not hold it back.
     needs: ci
     runs-on: ubuntu-latest
     environment: release
@@ -44,3 +46,26 @@ jobs:
       - run: cargo publish -p expensify-cli --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release:
+    name: github release
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the release unless it already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+
+  binaries:
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/binaries.yml
+    with:
+      upload: true
