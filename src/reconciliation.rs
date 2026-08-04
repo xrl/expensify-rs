@@ -5,7 +5,6 @@ use time::Date;
 use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
-use crate::export::ExportFormat;
 use crate::file::{ExportedFile, FileSystem};
 use crate::template::ReconciliationTemplate;
 use crate::wire;
@@ -18,6 +17,26 @@ pub enum ReconciliationScope {
     Unreported,
     /// All card transactions in the window.
     All,
+}
+
+/// `outputSettings.fileExtension` for the reconciliation job.
+///
+/// Narrower than [`ExportFormat`](crate::ExportFormat), which the exporter
+/// uses: reconciliation accepts only these four, so the other spellings are
+/// unrepresentable rather than server-rejected. Same split as
+/// [`ReportFieldDefType`](crate::ReportFieldDefType) vs
+/// [`ReportFieldType`](crate::ReportFieldType).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReconciliationFormat {
+    /// Comma-separated values (the server default).
+    Csv,
+    /// Plain text.
+    Txt,
+    /// JSON; pair with a [`Json`](crate::Json) template marker.
+    Json,
+    /// XML.
+    Xml,
 }
 
 /// Reconciliation job (`type: "reconciliation"`). Domain-admin credentials
@@ -34,7 +53,7 @@ pub struct ReconcileAction<F> {
     pub(crate) end: Date,
     pub(crate) scope: ReconciliationScope,
     pub(crate) feed: Option<String>,
-    pub(crate) format: Option<ExportFormat>,
+    pub(crate) format: Option<ReconciliationFormat>,
     pub(crate) email_on_finish: Option<String>,
     _out: PhantomData<fn() -> F>,
 }
@@ -69,9 +88,8 @@ impl<F> ReconcileAction<F> {
         self
     }
 
-    /// Only Csv, Txt, Json, Xml are valid here (server-validated).
-    /// Default: Csv.
-    pub fn format(mut self, format: ExportFormat) -> Self {
+    /// Default: [`ReconciliationFormat::Csv`].
+    pub fn format(mut self, format: ReconciliationFormat) -> Self {
         self.format = Some(format);
         self
     }

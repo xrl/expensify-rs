@@ -97,7 +97,12 @@ async fn month_end_close(client: &Client, policy: PolicyId) -> Result<(), expens
 }
 
 #[tokio::main]
-async fn main() {
-    let client = Client::new(Credentials::new("id", "secret"));
-    let _ = month_end_close(&client, PolicyId::new("0123456789ABCDEF")).await;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new(Credentials::new(
+        std::env::var("EXPENSIFY_PARTNER_USER_ID")?,
+        std::env::var("EXPENSIFY_PARTNER_USER_SECRET")?,
+    ));
+    let policy = PolicyId::new(std::env::var("EXPENSIFY_POLICY_ID")?);
+    month_end_close(&client, policy).await?;
+    Ok(())
 }

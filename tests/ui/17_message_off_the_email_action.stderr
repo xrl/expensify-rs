@@ -1,0 +1,5 @@
+error[E0599]: no method named `message` found for struct `OnFinish` in the current scope
+ --> tests/ui/17_message_off_the_email_action.rs:8:52
+  |
+8 |     let _ = OnFinish::mark_as_exported("acme-etl").message("month end close");
+  |                                                    ^^^^^^^ method not found in `OnFinish`

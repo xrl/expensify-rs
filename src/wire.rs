@@ -40,7 +40,7 @@ use crate::policy::{
     CreatedPolicy, ListPoliciesAction, PolicyPlan, PolicySummary, SetTagApproversAction,
     TagApprover, TagsSource, UpdateMode, UpdatePolicyAction,
 };
-use crate::reconciliation::{ReconcileAction, ReconciliationScope};
+use crate::reconciliation::{ReconcileAction, ReconciliationFormat, ReconciliationScope};
 use crate::reports::{
     CreateReportAction, CreatedReport, ReimburseOutcome, ReimburseTargets, SkippedReport,
 };
@@ -115,9 +115,17 @@ fn export_format(format: ExportFormat) -> &'static str {
         ExportFormat::Xls => "xls",
         ExportFormat::Xlsx => "xlsx",
         ExportFormat::Txt => "txt",
-        ExportFormat::Pdf => "pdf",
         ExportFormat::Json => "json",
         ExportFormat::Xml => "xml",
+    }
+}
+
+fn reconciliation_format(format: ReconciliationFormat) -> &'static str {
+    match format {
+        ReconciliationFormat::Csv => "csv",
+        ReconciliationFormat::Txt => "txt",
+        ReconciliationFormat::Json => "json",
+        ReconciliationFormat::Xml => "xml",
     }
 }
 
@@ -589,9 +597,6 @@ pub(crate) fn export_reports<F>(action: &ExportReportsAction<F>) -> JobRequest {
         json!(export_format(action.format.unwrap_or(ExportFormat::Csv))),
     );
     opt!(output, "fileBasename", action.file_basename);
-    if action.include_full_page_receipts_pdf {
-        output.insert("includeFullPageReceiptsPdf".to_owned(), json!(true));
-    }
 
     let mut request = JobRequest::new("file")
         .set(
@@ -647,7 +652,10 @@ pub(crate) fn reconcile<F>(action: &ReconcileAction<F>) -> JobRequest {
         .input_settings(input)
         .set(
             "outputSettings",
-            json!({ "fileExtension": export_format(action.format.unwrap_or(ExportFormat::Csv)) }),
+            json!({
+                "fileExtension":
+                    reconciliation_format(action.format.unwrap_or(ReconciliationFormat::Csv))
+            }),
         )
         .template(&action.template);
 
@@ -1689,7 +1697,7 @@ mod tests {
     #[test]
     fn independent_tag_csv_sends_per_level_set_required() {
         let client = crate::Client::new(crate::Credentials::new("id", "secret"));
-        let action = client.update_policy("P1").tags(TagsUpdate::merge_csv(
+        let action = client.update_policy("P1").tags(TagsUpdate::replace_all_csv(
             Bytes::from_static(b"a,b\n"),
             TagCsvConfig::independent([true, false]).tsv(),
         ));
@@ -1715,10 +1723,9 @@ mod tests {
                     .values([ReportFieldValue::new("Ops").external_id("X1")])
                     .default_value("Ops"),
             ]))
-            .tags(TagsUpdate::merge_inline([TagLevel::new([PolicyTag::new(
-                "Core",
-            )
-            .gl_code("7000")])
+            .tags(TagsUpdate::replace_all_inline([TagLevel::new([
+                PolicyTag::new("Core").gl_code("7000"),
+            ])
             .named("Team")
             .required()]));
         let job = update_policy(&action).description().clone();
