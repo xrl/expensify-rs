@@ -1,0 +1,48 @@
+name: rust-setup
+description: Install a Rust toolchain and restore the shared build cache.
+
+inputs:
+  toolchain:
+    description: Toolchain to install. Pinned versions are deliberate; see ci.yml.
+    required: false
+    default: stable
+  components:
+    description: Extra rustup components, space-separated (e.g. "clippy rustfmt").
+    required: false
+    default: ""
+  targets:
+    description: Extra rustup targets, space-separated.
+    required: false
+    default: ""
+  cache-key:
+    description: >
+      Passed to rust-cache as `shared-key`, not `key`. rust-cache's generated key
+      embeds `github.job`, so every job here kept a private copy of the same
+      dependency graph; `shared-key` drops that segment, letting jobs — and the
+      warm-cache workflow on main — collide on one cache.
+    required: true
+  save:
+    description: >
+      Write the cache back afterwards. Only warm-cache.yml does: a single writer
+      keeps cache contents predictable, and stops each PR from minting its own
+      multi-hundred-MB copy against the repo's 10 GB cache budget.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # rust-cache folds `rustc -vV` and the RUST*/CARGO* environment into the key
+    # alongside Cargo.lock, so a toolchain bump, a flag change or a dependency
+    # change all invalidate on their own. That is what makes one shared key safe
+    # across toolchains: the pinned-rustc jobs cannot collide with stable's.
+    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save }}

@@ -1,0 +1,116 @@
+name: warm-cache
+
+# Build the dependency graph once on the default branch so PR jobs restore it
+# instead of recompiling it. GitHub scopes cache restore to a run's own ref plus
+# the default branch, so a cache seeded here is exactly what a PR can reach:
+# https://docs.github.com/en/actions/reference/dependency-caching-reference#restrictions-for-accessing-a-cache
+#
+# This is the only workflow that writes caches. Single-writer keeps their
+# contents predictable (whoever saves first wins a shared key, so letting CI
+# jobs save too would make the stored artifact set a race) and keeps the repo
+# off the 10 GB cache ceiling, which PR-side saves had already pushed us to.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "cli/Cargo.toml"
+      - ".github/actions/rust-setup/**"
+      - ".github/workflows/**"
+  # Cargo.lock is not the only cache input: `stable` moves without a commit, and
+  # GitHub drops caches untouched for 7 days. Re-warm before ci.yml's Monday run.
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: warm-cache
+  cancel-in-progress: true # superseded by a newer main push; this only warms a cache
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One cache for every stable-toolchain job in ci.yml. The four clippy/test
+  # permutations previously kept four near-identical copies of the same
+  # dependency builds; cargo fingerprints feature sets separately inside one
+  # target dir, so a single cache serves all of them.
+  ci:
+    name: ci caches (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          components: clippy
+          cache-key: stable
+          save: true
+      - run: cargo clippy --workspace --locked --all-targets --all-features
+      - run: cargo clippy --workspace --locked --all-targets
+      # `--no-run`: the point is the compiled artifacts, and ci.yml owns actually
+      # running the suite.
+      - run: cargo test --workspace --locked --all-features --no-run
+      - run: cargo test --workspace --locked --no-run
+      # No RUSTDOCFLAGS here, matching ci.yml's docs job, which sets it on the
+      # step rather than the job so both land on the same cache key.
+      - run: cargo doc --locked --all-features --no-deps -p expensify
+
+  # Separate key: trybuild's committed .stderr files are rustc-version-coupled,
+  # so this must never see artifacts from a job on a different toolchain. The
+  # rustc hash inside rust-cache's key would already keep them apart; the
+  # distinct shared key means a future toolchain edit cannot quietly merge them.
+  # Run for real, not --no-run: the expensive part is trybuild compiling each
+  # tests/ui case in its scratch project under target/, and that is what caches.
+  ui:
+    name: trybuild cache (rustc 1.96.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: "1.96.1"
+          cache-key: ui
+          save: true
+      - run: cargo test --locked --all-features -p expensify --test compile_fail
+
+  msrv:
+    name: msrv cache (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          toolchain: "1.88"
+          cache-key: msrv
+          save: true
+      - run: cargo check --locked --all-features -p expensify
+
+  # The release profile shares nothing with the debug artifacts above, and these
+  # are the longest jobs in the pipeline, so they get their own warm caches.
+  release:
+    name: release cache (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false # warming one architecture should not sink the others
+      matrix:
+        include:
+          # Must mirror binaries.yml exactly: a cache is only restorable by a job
+          # on the same runner OS/arch with the same key.
+          - runner: macos-26
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          targets: ${{ matrix.target }}
+          cache-key: rel-${{ matrix.target }}
+          save: true
+      - run: cargo build --release --locked -p expensify-cli --target ${{ matrix.target }}

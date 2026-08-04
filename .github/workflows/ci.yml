@@ -24,6 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Uncached: rustfmt parses, it does not compile, so there is nothing to reuse.
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
@@ -43,13 +44,10 @@ jobs:
             flags: --all-features
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: clippy-${{ matrix.name }}
+          cache-key: stable
       - run: cargo clippy --workspace --locked --all-targets ${{ matrix.flags }} -- -D warnings
 
   test:
@@ -65,12 +63,9 @@ jobs:
             flags: --all-features
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: test-${{ matrix.name }}
+          cache-key: stable
       # trybuild compares against committed rustc diagnostics, which drift
       # between releases; the `ui` job owns that check on a pinned toolchain.
       - run: cargo test --workspace --locked ${{ matrix.flags }} -- --skip misuses_do_not_compile
@@ -80,44 +75,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Pinned: bump only together with regenerating tests/ui/*.stderr.
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: ./.github/actions/rust-setup
         with:
+          # Pinned: bump only together with regenerating tests/ui/*.stderr. Kept
+          # on its own cache key for the same reason — these .stderr expectations
+          # are only valid for this exact rustc, so no stable-toolchain job may
+          # ever share a target dir with it.
           toolchain: "1.96.1"
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: ui
+          cache-key: ui
       - run: cargo test --locked --all-features -p expensify --test compile_fail
 
   docs:
     name: rustdoc
     runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: docs
+          cache-key: stable
       # Matches the docs.rs build configured in Cargo.toml. Library only:
       # the CLI is a binary, and its rustdoc output collides with the lib's.
+      #
+      # RUSTDOCFLAGS is set on the step, not the job: rust-cache folds RUST* env
+      # into its key, and a job-level value would fork this onto a private cache
+      # for no gain — it only governs warnings in this crate, which rustdoc
+      # rebuilds here either way.
       - run: cargo doc --locked --all-features --no-deps -p expensify
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Keep in step with `rust-version` in Cargo.toml.
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: ./.github/actions/rust-setup
         with:
+          # Keep in step with `rust-version` in Cargo.toml.
           toolchain: "1.88"
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: msrv
+          cache-key: msrv
       # Library only: `rust-version` is a promise to consumers, and neither
       # dev dependencies nor the CLI are part of it. (The CLI does build on
       # 1.88 today; that is not a promise.)
@@ -128,6 +124,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      # A prebuilt binary. cargo-deny-action is a Dockerfile action and spent
+      # 10-16s building its image on every single run.
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
         with:
-          command: check
+          tool: cargo-deny@0.20.2
+      # Deliberately uncached — both the target dir (cargo-deny compiles nothing,
+      # it reads Cargo.lock) and ~/.cargo/advisory-db. A cached advisory database
+      # would let this pass against yesterday's RustSec, which is the single
+      # thing the job exists to catch.
+      - run: cargo deny --locked check
