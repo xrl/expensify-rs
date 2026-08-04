@@ -10,7 +10,6 @@ description: >
   reports. Carries what `--help` cannot: where credentials come from, which
   operations need domain-admin rights or an unlock from Expensify support, which
   are irreversible, and which wire behaviours are unverified guesses.
-allowed-tools: Bash(expensify:*)
 ---
 
 # expensify CLI
