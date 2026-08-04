@@ -9,6 +9,12 @@ struct Maybe;
 impl FetchState for Maybe {
     type Wrap<T: expensify::Payload> = T;
 
+    // Deliberately complete: the seal must be what rejects this impl, not a
+    // missing item.
+    fn project<T: expensify::Payload>(wrapped: T) -> Option<T> {
+        Some(wrapped)
+    }
+
     fn extract<T>(
         _field: &'static str,
         _value: Option<serde_json::Value>,

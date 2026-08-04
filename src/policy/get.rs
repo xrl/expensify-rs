@@ -7,12 +7,18 @@
 //! flag is `Fetched` and an inert [`NotFetched`] placeholder where it is
 //! not. Reading data you did not request is a compile error, not an
 //! `unwrap`.
+//!
+//! Callers whose selection is data rather than source code use
+//! [`Client::get_policies_dynamic`](crate::Client::get_policies_dynamic),
+//! which trades that guarantee back for `Option`s. Both getters share one
+//! request path; only the response shaping differs.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 use crate::BoxFuture;
 use crate::client::Client;
@@ -38,6 +44,24 @@ impl<T: fmt::Debug + Clone + Send + Sync + 'static> Payload for T {}
 pub trait FetchState: sealed::Sealed + Send + Sync + 'static {
     /// `T` when fetched, [`NotFetched`] when omitted.
     type Wrap<T: Payload>: Payload;
+
+    /// The inverse of [`Wrap`](FetchState::Wrap): read a payload back out of
+    /// its slot. [`Fetched`] yields `Some`, [`Omitted`] yields `None`.
+    ///
+    /// Code generic over the states cannot inspect a `Wrap<T>` — that is the
+    /// point of the design — so this is the one way back down to a runtime
+    /// shape, for a caller bridging a statically-typed [`Policy`] into a
+    /// context that has to treat every section uniformly:
+    ///
+    /// ```
+    /// use expensify::{FetchState, Fetched, NotFetched, Omitted};
+    ///
+    /// assert_eq!(Fetched::project::<u8>(7), Some(7));
+    /// assert_eq!(Omitted::project::<u8>(NotFetched), None);
+    /// ```
+    ///
+    /// [`Policy::project`] applies this to all five sections at once.
+    fn project<T: Payload>(wrapped: Self::Wrap<T>) -> Option<T>;
 
     /// Deserialization hook, so one generic `IntoFuture` impl serves all 32
     /// combinations of states.
@@ -69,6 +93,10 @@ impl sealed::Sealed for Omitted {}
 impl FetchState for Fetched {
     type Wrap<T: Payload> = T;
 
+    fn project<T: Payload>(wrapped: T) -> Option<T> {
+        Some(wrapped)
+    }
+
     fn extract<T>(field: &'static str, value: Option<serde_json::Value>) -> Result<T, Error>
     where
         T: DeserializeOwned + Payload,
@@ -85,6 +113,10 @@ impl FetchState for Fetched {
 impl FetchState for Omitted {
     type Wrap<T: Payload> = NotFetched;
 
+    fn project<T: Payload>(_wrapped: NotFetched) -> Option<T> {
+        None
+    }
+
     fn extract<T>(
         _field: &'static str,
         _value: Option<serde_json::Value>,
@@ -93,6 +125,45 @@ impl FetchState for Omitted {
         T: DeserializeOwned + Payload,
     {
         Ok(NotFetched)
+    }
+}
+
+/// A section of the policy response — the runtime spelling of the `with_*`
+/// selections, for [`Client::get_policies_dynamic`](crate::Client::get_policies_dynamic).
+///
+/// Closed on purpose: these are the values this crate *sends*, and Expensify
+/// rejects any other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PolicyField {
+    /// Expense categories.
+    Categories,
+    /// Report fields.
+    ReportFields,
+    /// Tags.
+    Tags,
+    /// The tax configuration.
+    Tax,
+    /// Policy members.
+    Employees,
+}
+
+impl PolicyField {
+    /// Spelling in `inputSettings.fields`; the response keys its sections
+    /// with the same names.
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::Categories => "categories",
+            Self::ReportFields => "reportFields",
+            Self::Tags => "tags",
+            Self::Tax => "tax",
+            Self::Employees => "employees",
+        }
+    }
+}
+
+impl From<&PolicyField> for PolicyField {
+    fn from(field: &PolicyField) -> Self {
+        *field
     }
 }
 
@@ -123,6 +194,59 @@ pub struct Policy<
 /// Return type of an awaited [`GetPoliciesAction`], keyed by policy ID.
 pub type Policies<Cats, Fields, Tags, Tax, Emps> =
     HashMap<PolicyId, Policy<Cats, Fields, Tags, Tax, Emps>>;
+
+impl<Cats, Fields, Tags, Tax, Emps> Policy<Cats, Fields, Tags, Tax, Emps>
+where
+    Cats: FetchState,
+    Fields: FetchState,
+    Tags: FetchState,
+    Tax: FetchState,
+    Emps: FetchState,
+{
+    /// Erase the typestate: every section becomes an `Option`, `None` where
+    /// it was not requested.
+    ///
+    /// This throws away the guarantee the type parameters carry, so it is for
+    /// crossing into code that must handle all five sections uniformly —
+    /// rendering, serializing, a plugin boundary. Reading a section straight
+    /// off [`Policy`] needs no `unwrap` and no `None` arm; prefer that.
+    #[must_use]
+    pub fn project(self) -> DynamicPolicy {
+        DynamicPolicy {
+            categories: Cats::project(self.categories),
+            report_fields: Fields::project(self.report_fields),
+            tags: Tags::project(self.tags),
+            tax: Tax::project(self.tax),
+            employees: Emps::project(self.employees),
+        }
+    }
+}
+
+/// A policy whose sections are shaped at runtime: `Some` for a requested
+/// section, `None` for one that was not.
+///
+/// Produced by [`Client::get_policies_dynamic`](crate::Client::get_policies_dynamic)
+/// and by [`Policy::project`]. The `Option`s are the cost of not knowing the
+/// selection at compile time — see the escape-hatch note on
+/// `get_policies_dynamic`.
+#[derive(Clone, Debug)]
+pub struct DynamicPolicy {
+    /// Expense categories, `Some` if [`PolicyField::Categories`] was requested.
+    pub categories: Option<Vec<Category>>,
+    /// Report fields, `Some` if [`PolicyField::ReportFields`] was requested.
+    pub report_fields: Option<Vec<ReportField>>,
+    /// Tags, `Some` if [`PolicyField::Tags`] was requested.
+    pub tags: Option<PolicyTags>,
+    /// Tax configuration. The outer `Option` is request-dependent; the inner
+    /// one is data-dependent (`None` = the policy has no tax configuration),
+    /// exactly the distinction [`Policy::tax`] keeps apart by construction.
+    pub tax: Option<Option<TaxConfig>>,
+    /// Policy members, `Some` if [`PolicyField::Employees`] was requested.
+    pub employees: Option<Vec<PolicyEmployee>>,
+}
+
+/// Return type of an awaited [`GetPoliciesDynamicAction`], keyed by policy ID.
+pub type DynamicPolicies = HashMap<PolicyId, DynamicPolicy>;
 
 /// First stage of the Policy Getter: not awaitable. At least one `with_*`
 /// selection is required (the API rejects an empty `fields` list), so
@@ -204,7 +328,7 @@ pub struct GetPoliciesAction<
     ids: Vec<PolicyId>,
     /// Wire `fields` values accumulated by `with_*` calls; the type
     /// parameters shape only the response.
-    fields: Vec<&'static str>,
+    fields: Vec<PolicyField>,
     user_email: Option<String>,
     // `fn() -> _` keeps the action `Send + Sync` regardless of the states.
     #[allow(clippy::type_complexity)]
@@ -227,7 +351,7 @@ where
 
     fn cast<C2, F2, T2, X2, E2>(
         mut self,
-        field: &'static str,
+        field: PolicyField,
     ) -> GetPoliciesAction<C2, F2, T2, X2, E2>
     where
         C2: FetchState,
@@ -256,7 +380,7 @@ where
 {
     /// Request expense categories.
     pub fn with_categories(self) -> GetPoliciesAction<Fetched, Fields, Tags, Tax, Emps> {
-        self.cast("categories")
+        self.cast(PolicyField::Categories)
     }
 }
 
@@ -269,7 +393,7 @@ where
 {
     /// Request report fields.
     pub fn with_report_fields(self) -> GetPoliciesAction<Cats, Fetched, Tags, Tax, Emps> {
-        self.cast("reportFields")
+        self.cast(PolicyField::ReportFields)
     }
 }
 
@@ -282,7 +406,7 @@ where
 {
     /// Request tags.
     pub fn with_tags(self) -> GetPoliciesAction<Cats, Fields, Fetched, Tax, Emps> {
-        self.cast("tags")
+        self.cast(PolicyField::Tags)
     }
 }
 
@@ -295,7 +419,7 @@ where
 {
     /// Request the tax configuration.
     pub fn with_tax(self) -> GetPoliciesAction<Cats, Fields, Tags, Fetched, Emps> {
-        self.cast("tax")
+        self.cast(PolicyField::Tax)
     }
 }
 
@@ -308,7 +432,7 @@ where
 {
     /// Request policy members.
     pub fn with_employees(self) -> GetPoliciesAction<Cats, Fields, Tags, Tax, Fetched> {
-        self.cast("employees")
+        self.cast(PolicyField::Employees)
     }
 }
 
@@ -325,37 +449,225 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            if self.ids.is_empty() {
-                return Err(Error::InvalidRequest(
-                    "get_policies needs at least one policy ID; \
-                     an empty policyIDList is a documented 410"
-                        .to_owned(),
-                ));
-            }
-            let request = wire::get_policies(&self.ids, &self.fields, self.user_email.as_deref());
-            let response = self.client.send(request).await?;
+            let raw = fetch(self.client, self.ids, self.fields, self.user_email).await?;
 
             let mut policies = Policies::new();
-            for (id, mut info) in wire::policy_info(response)? {
-                let mut section = |key: &str| info.as_object_mut().and_then(|map| map.remove(key));
-                let categories = section("categories");
-                let report_fields = section("reportFields");
-                let tags = section("tags");
-                let tax = section("tax").map(wire::normalize_tax);
-                let employees = section("employees");
-
+            for (id, sections) in raw {
                 policies.insert(
                     id,
                     Policy {
-                        categories: Cats::extract("categories", categories)?,
-                        report_fields: Fields::extract("reportFields", report_fields)?,
-                        tags: Tags::extract("tags", tags)?,
-                        tax: Tax::extract("tax", tax)?,
-                        employees: Emps::extract("employees", employees)?,
+                        categories: Cats::extract("categories", sections.categories)?,
+                        report_fields: Fields::extract("reportFields", sections.report_fields)?,
+                        tags: Tags::extract("tags", sections.tags)?,
+                        tax: Tax::extract("tax", sections.tax)?,
+                        employees: Emps::extract("employees", sections.employees)?,
                     },
                 );
             }
             Ok(policies)
         })
+    }
+}
+
+// ---- the dynamic escape hatch ---------------------------------------
+
+/// Policy Getter with a runtime field selection. Awaits to
+/// [`DynamicPolicies`].
+///
+/// See [`Client::get_policies_dynamic`](crate::Client::get_policies_dynamic)
+/// for when this is the right getter — usually it is not.
+#[must_use = "actions do nothing until awaited"]
+pub struct GetPoliciesDynamicAction {
+    client: Client,
+    ids: Vec<PolicyId>,
+    fields: Vec<PolicyField>,
+    user_email: Option<String>,
+}
+
+impl GetPoliciesDynamicAction {
+    pub(crate) fn new(client: Client, ids: Vec<PolicyId>, fields: Vec<PolicyField>) -> Self {
+        // The static path cannot select a field twice (each `with_*` exists
+        // only while its slot is `Omitted`); a `Vec` can, so dedupe here
+        // rather than send `["tax","tax"]`.
+        let mut deduped: Vec<PolicyField> = Vec::with_capacity(fields.len());
+        for field in fields {
+            if !deduped.contains(&field) {
+                deduped.push(field);
+            }
+        }
+        Self {
+            client,
+            ids,
+            fields: deduped,
+            user_email: None,
+        }
+    }
+
+    /// See [`GetPoliciesBuilder::on_behalf_of`].
+    pub fn on_behalf_of(mut self, email: impl Into<String>) -> Self {
+        self.user_email = Some(email.into());
+        self
+    }
+}
+
+impl IntoFuture for GetPoliciesDynamicAction {
+    type Output = Result<DynamicPolicies, Error>;
+    type IntoFuture = BoxFuture<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let wanted = |field: PolicyField| self.fields.contains(&field);
+            let (categories, report_fields, tags, tax, employees) = (
+                wanted(PolicyField::Categories),
+                wanted(PolicyField::ReportFields),
+                wanted(PolicyField::Tags),
+                wanted(PolicyField::Tax),
+                wanted(PolicyField::Employees),
+            );
+
+            let raw = fetch(self.client, self.ids, self.fields, self.user_email).await?;
+
+            let mut policies = DynamicPolicies::new();
+            for (id, sections) in raw {
+                policies.insert(
+                    id,
+                    DynamicPolicy {
+                        categories: selected(categories, "categories", sections.categories)?,
+                        report_fields: selected(
+                            report_fields,
+                            "reportFields",
+                            sections.report_fields,
+                        )?,
+                        tags: selected(tags, "tags", sections.tags)?,
+                        tax: selected(tax, "tax", sections.tax)?,
+                        employees: selected(employees, "employees", sections.employees)?,
+                    },
+                );
+            }
+            Ok(policies)
+        })
+    }
+}
+
+/// Decode one section iff it was requested. Delegates to [`Fetched::extract`]
+/// so a section the server left out of a response that asked for it is the
+/// same error on both getters.
+fn selected<T>(
+    requested: bool,
+    field: &'static str,
+    value: Option<Value>,
+) -> Result<Option<T>, Error>
+where
+    T: DeserializeOwned + Payload,
+{
+    if requested {
+        Fetched::extract::<T>(field, value).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+// ---- shared request path --------------------------------------------
+
+/// One policy's response object, split into sections but not yet decoded.
+struct RawSections {
+    categories: Option<Value>,
+    report_fields: Option<Value>,
+    tags: Option<Value>,
+    tax: Option<Value>,
+    employees: Option<Value>,
+}
+
+/// Everything both getters do identically: validate, send, split. The static
+/// getter and the dynamic one differ only in how they decode the sections.
+async fn fetch(
+    client: Client,
+    ids: Vec<PolicyId>,
+    fields: Vec<PolicyField>,
+    user_email: Option<String>,
+) -> Result<Vec<(PolicyId, RawSections)>, Error> {
+    if ids.is_empty() {
+        return Err(Error::InvalidRequest(
+            "get_policies needs at least one policy ID; \
+             an empty policyIDList is a documented 410"
+                .to_owned(),
+        ));
+    }
+    // Unreachable from the static path, where `GetPoliciesBuilder` is the
+    // type-level proof of one selection; reachable from the dynamic one.
+    if fields.is_empty() {
+        return Err(Error::InvalidRequest(
+            "get_policies needs at least one field; \
+             an empty fields list is a documented 410"
+                .to_owned(),
+        ));
+    }
+
+    let request = wire::get_policies(&ids, &fields, user_email.as_deref());
+    let response = client.send(request).await?;
+
+    Ok(wire::policy_info(response)?
+        .into_iter()
+        .map(|(id, mut info)| {
+            let mut section = |key: &str| info.as_object_mut().and_then(|map| map.remove(key));
+            let sections = RawSections {
+                categories: section("categories"),
+                report_fields: section("reportFields"),
+                tags: section("tags"),
+                tax: section("tax").map(wire::normalize_tax),
+                employees: section("employees"),
+            };
+            (id, sections)
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_inverts_wrap() {
+        assert_eq!(Fetched::project::<u8>(7), Some(7));
+        assert_eq!(Omitted::project::<u8>(NotFetched), None);
+    }
+
+    /// The reason `project` is on the trait: without it, code generic over
+    /// the states can hold a `Wrap<T>` and never look inside.
+    #[test]
+    fn project_works_through_a_generic() {
+        fn read<S: FetchState>(slot: S::Wrap<Vec<Category>>) -> usize {
+            S::project(slot).map_or(0, |categories| categories.len())
+        }
+
+        assert_eq!(read::<Fetched>(vec![Category::new("Meals")]), 1);
+        assert_eq!(read::<Omitted>(NotFetched), 0);
+    }
+
+    #[test]
+    fn projecting_a_policy_keeps_the_requested_sections() {
+        let policy: Policy<Fetched, Omitted, Omitted, Fetched, Omitted> = Policy {
+            categories: vec![Category::new("Meals")],
+            report_fields: NotFetched,
+            tags: NotFetched,
+            tax: None,
+            employees: NotFetched,
+        };
+
+        let projected = policy.project();
+        assert_eq!(projected.categories.as_deref().map(<[_]>::len), Some(1));
+        assert!(projected.report_fields.is_none());
+        assert!(projected.employees.is_none());
+        // Requested but unconfigured: outer Some, inner None.
+        assert_eq!(projected.tax, Some(None));
+    }
+
+    #[test]
+    fn wire_names_match_the_static_selections() {
+        assert_eq!(PolicyField::Categories.wire(), "categories");
+        assert_eq!(PolicyField::ReportFields.wire(), "reportFields");
+        assert_eq!(PolicyField::Tags.wire(), "tags");
+        assert_eq!(PolicyField::Tax.wire(), "tax");
+        assert_eq!(PolicyField::Employees.wire(), "employees");
     }
 }

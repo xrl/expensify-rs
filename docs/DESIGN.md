@@ -158,9 +158,18 @@ impl Client {
     pub fn builder(credentials: Credentials) -> ClientBuilder;
 }
 
-pub struct ClientBuilder;   // base_url(reqwest::Url), http_client(reqwest::Client),
+pub struct ClientBuilder;   // base_url(Url), http_client(reqwest::Client),
                             // no_rate_limiting(), build() -> Client
 ```
+
+`reqwest` is re-exported (`expensify::reqwest`, plus `expensify::Url` for the
+one type that appears in a signature callers write). Four reqwest types are
+in this crate's public API — `Url`, `reqwest::Client`, `reqwest::Error`
+inside `Error::Transport`, `StatusCode` inside `Error::Http` — and none of
+them were nameable without a second dependency, which would also be a second
+*version*: a `Url` from a differently-versioned `url` crate is a different
+type and would not compile. See [§ Rejected mechanisms](#rejected-mechanisms)
+for why `base_url` still takes a parsed `Url` rather than `impl TryInto<Url>`.
 
 `Client::domain(name) -> DomainClient` scopes the two operations whose
 jobs require a `domain` input (reconciliation, domain card list):
@@ -337,11 +346,15 @@ exposed — only `false` is supported upstream, so there is no parameter
 
 The Policy Getter's `fields` list decides which response sections exist.
 Runtime modeling would be five `Option`s and an `unwrap` at every use
-site — the exact shape `verbose_results()` fixed, times five.
+site — the exact shape `verbose_results()` fixed, times five. (That shape
+does exist, as a deliberate opt-out for callers whose selection is not known
+until run time — see
+[§ The dynamic escape hatch](#the-dynamic-escape-hatch-and-what-it-costs).)
 
 ```rust
 pub trait FetchState: sealed + Send + Sync + 'static {
     type Wrap<T: Payload>: Payload;               // GAT
+    fn project<T: Payload>(wrapped: Self::Wrap<T>) -> Option<T>;   // the inverse of Wrap
     #[doc(hidden)] fn extract<T: DeserializeOwned + Payload>(
         field: &'static str, value: Option<serde_json::Value>) -> Result<Self::Wrap<T>, Error>;
 }
@@ -355,6 +368,15 @@ pub trait Payload: Debug + Clone + Send + Sync + 'static {}   // blanket impl
 per-field where-clauses. `extract` is the deserialization hook so one
 generic `IntoFuture` impl serves all 32 states. `FetchState` is sealed:
 a third state has no meaning and would break `extract`'s contract.
+
+`project` is `Wrap`'s inverse, and exists because `Wrap` alone is a one-way
+door: code generic over the states can hold a `Wrap<T>` and has no way to
+look inside, so every dynamic consumer was re-deriving this trait locally
+(the CLI had one, and could only write it because both states and the GAT
+are public). Adding it to the trait is not a new capability — it is the
+capability callers already had, spelled once. It cannot weaken the static
+path: nothing in `Policy`'s fields changes, and `Omitted::project` can only
+answer `None`.
 
 ```rust
 #[derive(Clone, Debug)]
@@ -407,6 +429,68 @@ caller names the states they rely on (e.g.
 `Policy<Fetched, Omitted, Omitted, Fetched, Omitted>`); that verbosity is
 the accepted cost, noted here as a judgement call.
 
+### The dynamic escape hatch, and what it costs
+
+```rust
+pub enum PolicyField { Categories, ReportFields, Tags, Tax, Employees }  // closed; Copy, Eq, Hash
+
+impl Client {
+    pub fn get_policies_dynamic(&self, ids: impl IntoIterator<Item: Into<PolicyId>>,
+                                fields: impl IntoIterator<Item: Into<PolicyField>>)
+        -> GetPoliciesDynamicAction;                       // #[must_use]; on_behalf_of(email)
+}
+impl IntoFuture for GetPoliciesDynamicAction { type Output = Result<DynamicPolicies, Error>; }
+
+pub struct DynamicPolicy { categories: Option<Vec<Category>>, report_fields: ..,
+                           tags: Option<PolicyTags>, tax: Option<Option<TaxConfig>>,
+                           employees: .. }                 // Clone, Debug; pub fields
+pub type DynamicPolicies = HashMap<PolicyId, DynamicPolicy>;
+
+impl<..all FetchState..> Policy<..> { pub fn project(self) -> DynamicPolicy }
+```
+
+This is a real concession, and worth naming as one: everything above argues
+that a request-dependent `Option` is the defect this mechanism exists to
+delete, and `DynamicPolicy` puts five of them back. `tax` gets the shape the
+design explicitly set out to avoid — `Option<Option<TaxConfig>>`, outer
+request-dependent, inner data-dependent — where `Policy` keeps those two
+kinds of absence in different type positions.
+
+It earns its place because the alternative is worse for the caller it serves.
+A caller whose selection is *data* (argv flags, a config file, an RPC field)
+cannot reach `GetPoliciesAction` at all without branching over the states,
+and the CLI's attempt is the evidence: a five-function generic ladder,
+one stage per type parameter, whose only purpose was to turn five booleans
+into 32 monomorphized leaves. That code is not safer than an `Option` — it is
+an `Option` written in type parameters, plus ~90 lines that must stay in sync
+with the field list. Reading the flags as data is the honest spelling of a
+runtime fact.
+
+What is given up, precisely:
+
+- Reading an unrequested section is `None` instead of a compile error
+  (misuse 4 does not apply to `DynamicPolicy`).
+- "At least one field" degrades from a type-level proof (`GetPoliciesBuilder`
+  is not a future — misuse 5) to `Error::InvalidRequest` at `.await`. Same
+  class as case 7's empty-iterator residue: the API rejects it, no type can
+  see it, so it is runtime-but-loud and nothing is sent.
+- Double-selecting a field is a method-not-found error on the static path
+  (misuse 11); here it is deduplicated silently, because a `Vec` can hold
+  the same value twice and rejecting it would fail requests that mean
+  exactly what they say.
+
+What is *not* given up: the request path. The wire `fields` list was already
+runtime state inside `GetPoliciesAction` — only response shaping was ever
+static — so both getters call one private `fetch`, which validates, sends and
+splits the response into undecoded sections. The dynamic getter then decodes
+each requested section through `Fetched::extract`, the same hook the static
+one uses, so a section that was requested and did not come back is the same
+`DecodeError` on both. There is one request path and one wire-name table
+(`PolicyField::wire`), which the `with_*` setters push into as well.
+
+`get_policies` stays the documented default; `get_policies_dynamic`'s rustdoc
+says outright that it reintroduces the `unwrap` and names the case it is for.
+
 ## Reimbursement: strict vs tolerant 207
 
 `responseCode: 207` means partial success. The silent-partial bug — code
@@ -446,6 +530,7 @@ Expensify accepts, so the method name *is* the status.
 | Reconciliation (`reconciliation`) | `DomainClient::reconcile(&ReconciliationTemplate<F>, start, end, scope)` | `ReconcileAction<F>` | `ExportedFile<F>` |
 | Policy List Getter (`get`/`policyList`) | `Client::list_policies()` | `ListPoliciesAction` | `Vec<PolicySummary>` |
 | Policy Getter (`get`/`policy`) | `Client::get_policies(ids)` | `GetPoliciesBuilder` → `GetPoliciesAction<..>` | `HashMap<PolicyId, Policy<..>>` |
+| Policy Getter, runtime selection | `Client::get_policies_dynamic(ids, fields)` | `GetPoliciesDynamicAction` | `HashMap<PolicyId, DynamicPolicy>` |
 | Domain Cards Getter (`get`/`domainCardList`) | `DomainClient::card_list()` | `DomainCardListAction` | `Vec<DomainCard>` |
 | Policy Creator (`create`/`policy`) | `Client::create_policy(name)` | `CreatePolicyAction` | `CreatedPolicy` |
 | Report Creator (`create`/`report`) | `Client::create_report(policy, email, title, expenses)` | `CreateReportAction` | `CreatedReport` |
@@ -584,9 +669,13 @@ private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
     observed and undocumented.
   - `PolicySummary { id, name, owner, role, output_currency, plan }` —
     Deserialize.
-- `get.rs` — `Payload`, `FetchState` (sealed), `Fetched`, `Omitted`,
-  `NotFetched`, `Policy<..>`, `Policies<..>` alias, `GetPoliciesBuilder`,
-  `GetPoliciesAction<..>`. See [§ Policy getter](#policy-getter-fetch-flags-as-typestate).
+- `get.rs` — `Payload`, `FetchState` (sealed; `Wrap` GAT + `project`),
+  `Fetched`, `Omitted`, `NotFetched`, `Policy<..>` (+ `.project()`),
+  `Policies<..>` alias, `GetPoliciesBuilder`, `GetPoliciesAction<..>`, and
+  the runtime-selection half: `PolicyField` (Copy, Eq, Hash; closed),
+  `DynamicPolicy` (Clone, Debug; pub `Option` fields), `DynamicPolicies`
+  alias, `GetPoliciesDynamicAction`. See
+  [§ Policy getter](#policy-getter-fetch-flags-as-typestate).
 - `list.rs` — `ListPoliciesAction`: `.admin_only()`, `.on_behalf_of()`.
 - `create.rs` — `CreatePolicyAction`: `.plan(PolicyPlan)`;
   `CreatedPolicy { policy_id, name }`.
@@ -721,7 +810,7 @@ than an internal retry. No auto-retry in v1 (see Open questions).
 
 | crate | why |
 |---|---|
-| `reqwest` (no default features; `rustls-tls`, `charset`, `http2`) | HTTP; `multipart` pulled in only by the deprecated-updater feature |
+| `reqwest` (no default features; `rustls-tls`, `charset`, `http2`) | HTTP; `multipart` pulled in only by the deprecated-updater feature. Re-exported (`expensify::reqwest`), so its major version is part of this crate's semver surface — it already was, via four types in public signatures |
 | `serde` (+derive), `serde_json` | envelope + user-type bounds (`Serialize`/`DeserializeOwned`) |
 | `bytes` | zero-copy download payloads; `ExportedFile<Bytes>` default |
 | `time` (`serde`, `macros`, `formatting`, `parsing`) | `Date`/`PrimitiveDateTime` in the public API; lighter than chrono |
@@ -785,6 +874,10 @@ Each entry is a `trybuild` case under `tests/ui/` with a committed
 5. **Awaiting the policy getter with no fields** (documented 410):
    `client.get_policies([id]).await` — E0277: `GetPoliciesBuilder` is not
    a future.
+   Scope: this is the *static* getter's guarantee.
+   `get_policies_dynamic(ids, [])` is well-typed for the same reason an
+   empty iterator is (case 7), and is rejected at `.await` with
+   `Error::InvalidRequest`.
 6. **ID swaps**: `.report_id(policy_id)` — E0277:
    `ReportId: From<PolicyId>` not satisfied.
 7. **A filterless export constructor** (documented 410): `ReportsQuery`
@@ -808,7 +901,8 @@ Each entry is a `trybuild` case under `tests/ui/` with a committed
     `ExpenseLine::new(..).category("Meals")` — E0599.
 11. **Double-selecting a policy field**:
     `.with_tax().with_tax()` — E0599 (`with_tax` exists only while that
-    slot is `Omitted`).
+    slot is `Omitted`). The dynamic getter cannot borrow this —
+    a `Vec<PolicyField>` can hold a repeat — so it deduplicates instead.
 12. **`setRequired` shape mismatch on tag CSVs** (scalar vs per-level):
     unrepresentable — `TagCsvConfig::dependent` takes `bool`,
     `::independent` takes an iterator; there is no field to set wrongly.
@@ -885,6 +979,23 @@ it is additive, not a breaking change.
   would be speculative complexity with one impl.
 - **`FromExport` sealing** — left open deliberately: user-side CSV/XML
   markers are the escape hatch's escape hatch.
+- **A third `FetchState` for the dynamic getter** (`Dynamic`, with
+  `Wrap<T> = Option<T>`, making `DynamicPolicy` just `Policy<Dynamic, ..>`).
+  Tempting — it reuses `Policy` and the existing `IntoFuture` outright — and
+  rejected: `extract` would have no way to tell "not requested" from "the
+  server left out a section you asked for", so it would have to answer `None`
+  to both, turning a decode error into silent missing data. It would also
+  make misuse 15's seal an arbitrary line rather than a meaningful one. A
+  separate `DynamicPolicy` costs one struct and keeps `extract`'s contract.
+- **`ClientBuilder::base_url(impl TryInto<Url>)`** — the ergonomic fix for
+  "the URL type is not nameable" was to accept a string. Rejected in favour
+  of re-exporting `reqwest`: `build()` cannot fail, so a parse error would
+  have to be stashed and surfaced at the first `.await` — converting a
+  failure the caller can see at the point of the mistake into one that
+  appears later, from a different call, which is the trade this crate makes
+  in the other direction everywhere else. The re-export also fixes the three
+  *other* reqwest types in the public API, which `TryInto` would not touch.
+  `Url::parse` at the call site stays one line.
 
 ## Open questions
 

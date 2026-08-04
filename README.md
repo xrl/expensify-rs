@@ -8,7 +8,7 @@ Rust client for the [Expensify Integration Server API](https://integrations.expe
 
 ```toml
 [dependencies]
-expensify = "0.1"
+expensify = "0.2"
 ```
 
 Expensify exposes one endpoint that takes a JSON job description in a form
@@ -49,7 +49,9 @@ Options you don't set cost you nothing to ignore.
 Where the API's response shape depends on a request flag, a type parameter
 decides it instead of a boolean — so results don't arrive wrapped in `Option`
 for you to `unwrap`. Requesting a policy's tax rates gives you a `Policy` whose
-`tax` field exists; not requesting them makes reading `tax` a compile error.
+`tax` field exists; not requesting them makes reading `tax` a compile error. When
+the selection is only known at run time — CLI flags, a config file —
+`get_policies_dynamic` takes it as data and hands back `Option`s instead.
 
 Full rationale in [`docs/DESIGN.md`](docs/DESIGN.md). The approach is adapted
 from Isabel Atkinson's RustConf 2024 talk on the MongoDB Rust driver — see
@@ -63,6 +65,8 @@ from Isabel Atkinson's RustConf 2024 talk on the MongoDB Rust driver — see
 - **HTTP 200 does not mean success** in this API — the response body carries its
   own status code, and this crate maps it before handing you a result.
 - **rustls only.** No OpenSSL, no system TLS.
+- **`reqwest` is re-exported**, so the types in these signatures (`Url`,
+  `reqwest::Client`, `StatusCode`) are nameable without a second dependency.
 - MSRV 1.88.
 
 One optional feature, `employee-updater-deprecated`, gates Expensify's
