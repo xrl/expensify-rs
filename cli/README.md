@@ -1,0 +1,64 @@
+# expensify-cli
+
+Command-line client for the [Expensify Integration Server API](https://integrations.expensify.com/Integration-Server/doc/),
+built on the [`expensify`](https://crates.io/crates/expensify) library.
+
+```console
+$ cargo install expensify-cli
+$ expensify auth login
+$ expensify get policies
+```
+
+The binary is named `expensify`.
+
+## Commands
+
+Verb-noun, like `kubectl`. `-o json` on every read command, and exit codes
+documented in `expensify --help` so scripts can branch on them.
+
+```console
+$ expensify auth login|status|logout
+$ expensify get policies|policy|cards
+$ expensify export reports|reconciliation
+$ expensify download <HANDLE>
+$ expensify create policy|expenses|report|expense-rule
+$ expensify update policy|tag-approvers|expense-rule|employees
+$ expensify reimburse
+$ expensify completion <SHELL>
+$ expensify skill install
+```
+
+## Credentials
+
+Generate a partner pair at <https://www.expensify.com/tools/integrations/>.
+Expensify shows the secret **exactly once**.
+
+Resolution order is flags → environment (`EXPENSIFY_PARTNER_USER_ID` /
+`EXPENSIFY_PARTNER_USER_SECRET`) → OS keychain. A source supplying one half of
+the pair and not the other is an error rather than a fall-through, so a stale
+keychain entry can't silently pair with a fresh environment variable. Use the
+environment variables in CI — a runner has no keychain and `auth login` needs a
+TTY.
+
+## Agent skill
+
+`expensify skill install` writes a [Claude Code](https://claude.com/claude-code)
+skill into your skills directory. It covers what `--help` cannot: which
+operations need permissions you must request from Expensify support, which are
+irreversible, and which wire behaviours are unverified. `--print` writes it to
+stdout instead if you want to read it first.
+
+## Status
+
+The wire format has **not been verified against a live Expensify account** —
+Expensify publishes no OpenAPI spec, so every field name and value type is
+derived from their prose documentation. Some operations are deliberately
+withheld rather than shipped half-known; `expensify <command> --help` says which
+and why.
+
+Treat a surprising response as a plausible client bug rather than user error,
+and please report it.
+
+## License
+
+MIT OR Apache-2.0, at your option.

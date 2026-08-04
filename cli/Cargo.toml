@@ -6,6 +6,7 @@ rust-version = "1.88"
 description = "Command-line client for the Expensify Integration Server API"
 repository = "https://github.com/xrl/expensify-rs"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 keywords = ["expensify", "cli", "expenses", "accounting", "finance"]
 categories = ["command-line-utilities"]
 
