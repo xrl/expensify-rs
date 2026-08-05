@@ -1,9 +1,16 @@
 # Changelog
 
-## Unreleased
+## expensify 0.3.0 / expensify-cli 0.2.0 — 2026-08-05
 
-**Breaking — the next library release must be 0.3.0, not 0.2.1.** Four public
-signatures change shape (below). Everything else here is additive.
+**Breaking.** Four public library signatures change shape (below). Everything
+else here is additive.
+
+Five of these fixes exist because the crate was finally run against a live
+Expensify account. Every one was a documented behaviour that turned out to be
+inferred rather than observed, and the whole test suite was green throughout —
+the mocks asserted the same reading of the prose docs that the code did. The new
+`docs/DESIGN.md` § Verification status records which response shapes are now
+observed, which rest on a doc example, and which are still inference.
 
 ### Fixed against the live API
 
