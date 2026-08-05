@@ -260,8 +260,8 @@ the server has already done before you reach for a retry.
 
 Let the exit code choose the next move rather than tracing reflexively. Exit 4
 is a flat refusal with a known cause (account roles), so a transcript adds
-nothing; exits 2, 3 and 7 are the CLI's own verdicts and never need one. A
-decode or HTTP failure is the case worth capturing.
+nothing; 2 and 3 are settled before a request goes out, and a 429 (exit 7)
+explains itself. A decode or HTTP failure is the case worth capturing.
 
 `-vv` is the level that diagnoses a wire mismatch: request as sent with
 credentials redacted, response body verbatim, status and content-type. `-v` is
@@ -274,9 +274,10 @@ Report the defect at `xrl/expensify-rs` with `gh issue create`, following
 `.github/ISSUE_TEMPLATE/cli-defect.md`.
 
 **Search first** — `gh issue list --repo xrl/expensify-rs --search "export
-reports decode" --state all`, keying on the operation and the symptom. Several
-defects are known and being fixed right now; add a comment to the open issue
-rather than opening a near-duplicate.
+reports decode" --state all`, keying on the operation and the symptom. This
+client is young and its defect list moves quickly, so what you just hit is
+quite likely filed already, or fixed on `main` and not yet released. Comment on
+that issue instead; a flood of near-duplicates is worse than no report.
 
 Two leaks to close before you post, neither of which the CLI can close for you:
 
