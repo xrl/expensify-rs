@@ -6,6 +6,7 @@
 //! variable.
 
 use anyhow::{Result, bail};
+use expensify::Secret;
 use serde::{Deserialize, Serialize};
 
 pub const ENV_ID: &str = "EXPENSIFY_PARTNER_USER_ID";
@@ -35,7 +36,7 @@ impl Source {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub partner_user_id: String,
-    pub partner_user_secret: String,
+    pub partner_user_secret: Secret<String>,
     pub source: Source,
 }
 
@@ -117,14 +118,14 @@ impl SecretStore for Keychain {
 /// Flags, then environment, then keychain.
 pub fn resolve(
     flag_id: Option<&str>,
-    flag_secret: Option<&str>,
+    flag_secret: Option<&Secret<String>>,
     env: &dyn Env,
     store: &dyn SecretStore,
 ) -> Result<Resolved> {
     if flag_id.is_some() || flag_secret.is_some() {
         let (id, secret) = require_pair(
             flag_id,
-            flag_secret,
+            flag_secret.map(|secret| secret.expose().as_str()),
             "--partner-user-id",
             "--partner-user-secret",
         )?;
@@ -150,7 +151,7 @@ pub fn resolve(
     match store.load()? {
         Some((id, secret)) => Ok(Resolved {
             partner_user_id: id,
-            partner_user_secret: secret,
+            partner_user_secret: secret.into(),
             source: Source::Keychain,
         }),
         None => bail!(CredentialError(format!(
@@ -177,9 +178,9 @@ fn require_pair(
     secret: Option<&str>,
     id_name: &str,
     secret_name: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, Secret<String>)> {
     match (id, secret) {
-        (Some(id), Some(secret)) => Ok((id.to_owned(), secret.to_owned())),
+        (Some(id), Some(secret)) => Ok((id.to_owned(), secret.into())),
         (Some(_), None) => bail!(CredentialError(format!(
             "{id_name} is set but {secret_name} is not; set both"
         ))),
@@ -257,7 +258,7 @@ mod tests {
         let resolved = resolve(None, None, &env, &store).unwrap();
 
         assert_eq!(resolved.partner_user_id, "env-id");
-        assert_eq!(resolved.partner_user_secret, "env-secret");
+        assert_eq!(resolved.partner_user_secret.expose(), "env-secret");
         assert_eq!(resolved.source, Source::Environment);
     }
 
@@ -266,7 +267,7 @@ mod tests {
         let env = FakeEnv::with(&[(ENV_ID, "env-id"), (ENV_SECRET, "env-secret")]);
         let store = FakeStore::holding("keychain-id", "keychain-secret");
 
-        let resolved = resolve(Some("flag-id"), Some("flag-secret"), &env, &store).unwrap();
+        let resolved = resolve(Some("flag-id"), Some(&"flag-secret".into()), &env, &store).unwrap();
 
         assert_eq!(resolved.partner_user_id, "flag-id");
         assert_eq!(resolved.source, Source::Flags);

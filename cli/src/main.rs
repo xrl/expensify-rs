@@ -4,6 +4,7 @@ mod auth;
 mod cli;
 mod commands;
 mod error;
+mod observe;
 mod output;
 mod spec;
 mod view;
@@ -11,7 +12,8 @@ mod view;
 use std::process::ExitCode;
 
 use clap::Parser;
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -27,18 +29,33 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Logging is CLI-side only: the library emits no `tracing` events.
+/// Two ceilings, not one: our own diagnostics have to outrank the transport's.
+///
+/// `hyper`/`h2` log frame handling at DEBUG, so a single `max_level` loud
+/// enough to print request bodies buries them under frame noise — which is
+/// what `-vv` used to do. Dependencies stay at WARN until `-vvv` asks.
 fn init_logging(verbose: u8, quiet: bool) {
-    let level = match (quiet, verbose) {
-        (true, _) => LevelFilter::ERROR,
-        (_, 0) => LevelFilter::WARN,
-        (_, 1) => LevelFilter::INFO,
-        (_, _) => LevelFilter::DEBUG,
+    let (ours, dependencies) = match (quiet, verbose) {
+        (true, _) => (LevelFilter::ERROR, LevelFilter::OFF),
+        (_, 0) => (LevelFilter::WARN, LevelFilter::OFF),
+        (_, 1) => (LevelFilter::INFO, LevelFilter::WARN),
+        (_, 2) => (LevelFilter::DEBUG, LevelFilter::WARN),
+        (_, _) => (LevelFilter::TRACE, LevelFilter::DEBUG),
     };
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .without_time()
-        .with_writer(std::io::stderr)
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .without_time()
+                .with_writer(std::io::stderr),
+        )
+        // The binary's crate name is `expensify`, so this covers everything
+        // this repository emits.
+        .with(
+            Targets::new()
+                .with_target("expensify", ours)
+                .with_default(dependencies),
+        )
         .init();
 }

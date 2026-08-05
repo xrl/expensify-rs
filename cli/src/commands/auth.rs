@@ -47,7 +47,7 @@ fn login(args: LoginArgs, global: &GlobalArgs) -> Result<()> {
 fn status(global: &GlobalArgs) -> Result<()> {
     let resolved = resolve(
         global.partner_user_id.as_deref(),
-        global.partner_user_secret.as_deref(),
+        global.partner_user_secret.as_ref(),
         &ProcessEnv,
         &Keychain,
     )?;
@@ -60,7 +60,7 @@ fn status(global: &GlobalArgs) -> Result<()> {
         vec![vec![
             resolved.source.describe().to_owned(),
             resolved.partner_user_id.clone(),
-            format!("{} characters", resolved.partner_user_secret.len()),
+            format!("{} characters", resolved.partner_user_secret.expose().len()),
         ]],
         json!({
             "source": match resolved.source {
@@ -69,7 +69,7 @@ fn status(global: &GlobalArgs) -> Result<()> {
                 Source::Keychain => "keychain",
             },
             "partner_user_id": resolved.partner_user_id,
-            "secret_length": resolved.partner_user_secret.len(),
+            "secret_length": resolved.partner_user_secret.expose().len(),
         }),
     );
     view.print(global.output)

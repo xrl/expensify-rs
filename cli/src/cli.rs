@@ -2,10 +2,17 @@
 //! top to bottom.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use expensify::Secret;
 use time::Date;
 
 use crate::output::OutputFormat;
 use crate::spec::parse_date;
+
+/// So a secret typed on the command line is a `Secret` from the moment clap
+/// parses it, rather than a `String` that `Debug` would print.
+fn secret(raw: &str) -> Result<Secret<String>, std::convert::Infallible> {
+    Ok(Secret::new(raw.to_owned()))
+}
 
 /// Exit codes, documented in `--help` because scripts branch on them.
 const EXIT_CODES: &str = "\
@@ -65,8 +72,8 @@ pub struct GlobalArgs {
 
     /// Partner user secret, overriding the environment and the keychain [env:
     /// EXPENSIFY_PARTNER_USER_SECRET]
-    #[arg(long, global = true, value_name = "SECRET")]
-    pub partner_user_secret: Option<String>,
+    #[arg(long, global = true, value_name = "SECRET", value_parser = secret)]
+    pub partner_user_secret: Option<Secret<String>>,
 
     /// Post to a different Integration Server (testing, proxies)
     #[arg(long, global = true, value_name = "URL")]
@@ -77,7 +84,15 @@ pub struct GlobalArgs {
     pub no_rate_limit: bool,
 
     /// Log CLI activity to stderr; repeat for more detail
-    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    ///
+    /// -v    one line per API call: job type, endpoint, status, size, timing.
+    /// -vv   the whole exchange — request body as sent (credentials redacted)
+    ///       and the response body verbatim, with its content-type. Response
+    ///       bodies routinely contain personal data (employee names, email
+    ///       addresses, card numbers); treat the output accordingly.
+    /// -vvv  adds HTTP transport tracing from the underlying libraries, for
+    ///       when the suspect is the connection rather than the payload.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count, verbatim_doc_comment)]
     pub verbose: u8,
 
     /// Suppress progress notes on stderr

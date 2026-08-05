@@ -3,13 +3,13 @@
 //! `employee-updater-deprecated` feature.
 
 use std::collections::HashMap;
-use std::fmt;
 
 use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::export::SftpConnection;
 use crate::policy::PolicyRole;
+use crate::secret::{MaskedUrl, Secret};
 use crate::types::PolicyId;
 use crate::wire;
 
@@ -164,21 +164,22 @@ impl Employee {
 
 /// Where Expensify gets the employee feed (`dataSource`).
 ///
-/// [`fmt::Debug`] redacts the feed password — and any `user:pass@` in the
-/// feed URL — as [`Credentials`](crate::Credentials) and [`SftpConnection`]
-/// do.
-#[derive(Clone)]
+/// The feed password is a [`Secret`] and the feed URL is a [`MaskedUrl`],
+/// because `https://user:pass@host/feed.json` is a natural way to spell a
+/// basic-auth feed — so both halves of "the credentials for someone else's
+/// server" redact themselves.
+#[derive(Clone, Debug)]
 pub enum EmployeeSource {
     /// Feed sent inline in the request (`dataSource: "request"`).
     Inline(Vec<Employee>),
     /// Expensify downloads the feed (`dataSource: "download"`).
     FetchUrl {
-        /// Where to fetch the JSON feed from.
-        url: String,
+        /// Where to fetch the JSON feed from. `"https://…".into()`.
+        url: MaskedUrl,
         /// Basic-auth user, if the URL needs one.
         user: Option<String>,
-        /// Basic-auth password. Never printed by [`fmt::Debug`].
-        password: Option<String>,
+        /// Basic-auth password.
+        password: Option<Secret<String>>,
     },
     /// Expensify fetches the feed over SFTP (`dataSource: "sftp"`).
     Sftp {
@@ -187,34 +188,6 @@ pub enum EmployeeSource {
         /// Feed filename relative to the SFTP user's home directory.
         filename: String,
     },
-}
-
-impl fmt::Debug for EmployeeSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Inline(employees) => f.debug_tuple("Inline").field(employees).finish(),
-            Self::FetchUrl {
-                url,
-                user,
-                password,
-            } => f
-                .debug_struct("FetchUrl")
-                // `https://user:pass@host/feed.json` is a natural way to spell
-                // this, so the URL is a secret carrier like the rest.
-                .field("url", &crate::client::redact_userinfo(url))
-                .field("user", user)
-                .field("password", &password.as_ref().map(|_| "<redacted>"))
-                .finish(),
-            Self::Sftp {
-                connection,
-                filename,
-            } => f
-                .debug_struct("Sftp")
-                .field("connection", connection)
-                .field("filename", filename)
-                .finish(),
-        }
-    }
 }
 
 /// `setEmployeePrimaryPolicy`.

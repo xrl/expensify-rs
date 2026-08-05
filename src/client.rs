@@ -10,12 +10,14 @@ use crate::expense_rules::{CreateExpenseRuleAction, UpdateExpenseRuleAction};
 use crate::expenses::{CreateExpensesAction, Expense};
 use crate::export::{ExportReportsAction, ReportsQuery};
 use crate::file::{DownloadAction, ExportedFile};
+use crate::observe::Observer;
 use crate::policy::{
     CreatePolicyAction, GetPoliciesBuilder, GetPoliciesDynamicAction, ListPoliciesAction,
     PolicyField, SetTagApproversAction, TagApprover, UpdatePolicyAction,
 };
 use crate::reconciliation::{ReconcileAction, ReconciliationScope};
 use crate::reports::{CreateReportAction, ExpenseLine, ReimburseAction, ReimburseTargets, Strict};
+use crate::secret::{MaskedUrl, Secret};
 use crate::template::{ExportTemplate, FromExport, ReconciliationTemplate};
 use crate::types::{PolicyId, RuleId};
 
@@ -27,55 +29,31 @@ pub(crate) const DEFAULT_ENDPOINT: &str =
 /// expensify.com/tools/integrations/.
 ///
 /// The secret is shown once by Expensify and is never echoed by this type:
-/// the [`fmt::Debug`] impl redacts it.
-#[derive(Clone)]
+/// it is a [`Secret`], so no `Debug`, `Display` or observed request body can
+/// carry it.
+#[derive(Clone, Debug)]
 pub struct Credentials {
     pub(crate) partner_user_id: String,
-    pub(crate) partner_user_secret: String,
+    pub(crate) partner_user_secret: Secret<String>,
 }
 
 impl Credentials {
-    /// Wrap an ID/secret pair.
-    pub fn new(partner_user_id: impl Into<String>, partner_user_secret: impl Into<String>) -> Self {
+    /// Wrap an ID/secret pair. The secret accepts a `&str`, a `String`, or a
+    /// [`Secret<String>`] you already hold.
+    pub fn new(
+        partner_user_id: impl Into<String>,
+        partner_user_secret: impl Into<Secret<String>>,
+    ) -> Self {
         Self {
             partner_user_id: partner_user_id.into(),
             partner_user_secret: partner_user_secret.into(),
         }
     }
-}
 
-/// Manual impl: the secret must never reach logs.
-impl fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Credentials")
-            .field("partner_user_id", &self.partner_user_id)
-            .field("partner_user_secret", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Replace a URL's `user:pass@` with `<redacted>@`, keeping scheme, host and
-/// path — the parts a printed URL is printed for.
-///
-/// Hand-rolled rather than via `Url`: the inputs are caller-supplied strings
-/// that may not parse, and `url::Url`'s own `Debug` prints the password.
-pub(crate) fn redact_userinfo(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_owned();
-    };
-    let authority = scheme_end + 3;
-    let authority_end = url[authority..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |offset| authority + offset);
-    match url[authority..authority_end].rfind('@') {
-        None => url.to_owned(),
-        Some(at) => {
-            let mut redacted = String::with_capacity(url.len());
-            redacted.push_str(&url[..authority]);
-            redacted.push_str("<redacted>@");
-            redacted.push_str(&url[authority + at + 1..]);
-            redacted
-        }
+    /// The partner user ID. Not a secret: it identifies the integration, and
+    /// printing it is how you tell one credential from another.
+    pub fn partner_user_id(&self) -> &str {
+        &self.partner_user_id
     }
 }
 
@@ -89,6 +67,9 @@ pub(crate) struct ClientInner {
     pub(crate) credentials: Credentials,
     pub(crate) base_url: Url,
     pub(crate) limiter: Option<RateGate>,
+    /// `None` — the default — is what makes observability free when unused:
+    /// nothing is rendered, timed or cloned.
+    pub(crate) observer: Option<Arc<dyn Observer>>,
 }
 
 /// Entry point. Cheaply cloneable (`Arc` internally); actions hold a
@@ -112,6 +93,7 @@ impl Client {
             base_url: None,
             http: None,
             rate_limiting: true,
+            observer: None,
         }
     }
 
@@ -350,8 +332,9 @@ impl fmt::Debug for Client {
         f.debug_struct("Client")
             // `Url`'s own Debug prints `password` verbatim, and a caller-set
             // `base_url` may carry one.
-            .field("base_url", &redact_userinfo(self.inner.base_url.as_str()))
+            .field("base_url", &MaskedUrl::from(&self.inner.base_url))
             .field("credentials", &self.inner.credentials)
+            .field("observed", &self.inner.observer.is_some())
             .finish()
     }
 }
@@ -363,6 +346,7 @@ pub struct ClientBuilder {
     base_url: Option<Url>,
     http: Option<reqwest::Client>,
     rate_limiting: bool,
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl ClientBuilder {
@@ -400,6 +384,34 @@ impl ClientBuilder {
         self
     }
 
+    /// Watch every request and response this client makes.
+    ///
+    /// One observer, applied to every job — there is no per-operation opt-in
+    /// to forget. Pass a [`Recorder`](crate::Recorder) to capture exchanges in
+    /// memory, or any `Fn(&Exchange)` closure to log them:
+    ///
+    /// ```no_run
+    /// # fn f(credentials: expensify::Credentials) {
+    /// use expensify::{Client, Exchange};
+    ///
+    /// let client = Client::builder(credentials)
+    ///     .observe(|exchange: &Exchange| eprintln!("{exchange}"))
+    ///     .build();
+    /// # let _ = client;
+    /// # }
+    /// ```
+    ///
+    /// Calling this twice keeps the last observer.
+    ///
+    /// Credentials never appear in what an observer sees. **Response bodies
+    /// do carry personal data** — employee emails, names and card numbers —
+    /// so anything you write them to inherits that; see the
+    /// [module docs](crate::observe#personal-data).
+    pub fn observe(mut self, observer: impl Observer) -> Self {
+        self.observer = Some(Arc::new(observer));
+        self
+    }
+
     /// Finish configuration.
     ///
     /// # Panics
@@ -418,6 +430,7 @@ impl ClientBuilder {
                 credentials: self.credentials,
                 base_url,
                 limiter: self.rate_limiting.then(RateGate::new),
+                observer: self.observer,
             }),
         }
     }
@@ -500,16 +513,13 @@ mod tests {
     }
 
     #[test]
-    fn redaction_keeps_the_debuggable_half() {
-        assert_eq!(
-            redact_userinfo("https://hr:pw@acme.com/feed.json?x=1"),
-            "https://<redacted>@acme.com/feed.json?x=1"
-        );
-        // An `@` in the path is not userinfo.
-        assert_eq!(
-            redact_userinfo("https://acme.com/feed@latest.json"),
-            "https://acme.com/feed@latest.json"
-        );
-        assert_eq!(redact_userinfo("not a url"), "not a url");
+    fn observation_is_off_until_asked_for() {
+        let client = Client::new(Credentials::new("partner-id", "s3cret"));
+        assert!(client.inner.observer.is_none());
+
+        let observed = Client::builder(Credentials::new("partner-id", "s3cret"))
+            .observe(|_: &crate::Exchange| {})
+            .build();
+        assert!(observed.inner.observer.is_some());
     }
 }
