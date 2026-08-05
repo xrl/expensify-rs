@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## expensify 0.4.0 / expensify-cli 0.2.1 — 2026-08-05
 
-Recommended: **expensify 0.4.0**. Pre-1.0 a minor bump is the breaking-change
+**expensify 0.4.0**, not 0.3.1. Pre-1.0 a minor bump is the breaking-change
 signal, and this changes observable behaviour rather than adding to it — a
 `Json<_>` export that relied on the CSV default now renders JSON. Nobody
 plausibly relied on it (the pairing was already a decode failure at download),
