@@ -245,12 +245,12 @@ strictly `YYYY-MM-DD` — `07/01/2026` is a usage error.
 
 ## When a command fails
 
-**An error does not mean nothing happened.** `export reports` currently fails
-with a decode error (exit 10) *after* Expensify has run the export job — the
-break is in reading the answer, not in doing the work. Re-running starts a
+**An error does not mean nothing happened.** The decode failure (exit 10) that
+`export reports` shipped with is the case to keep in mind: it broke on *reading
+Expensify's answer*, after the export job had already run. Re-running starts a
 second job, and if the first carried `--mark-as-exported` the label is already
 on those reports; a retry applies it again, and there is no unmark. Ask what
-the server already did before you reach for a retry.
+the server has already done before you reach for a retry.
 
 | Command | Re-run it with `-vv`? |
 |---|---|
