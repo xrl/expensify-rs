@@ -37,8 +37,31 @@ you need when Expensify answers something other than the documented envelope.
 `-vvv` adds transport tracing from the HTTP stack.
 
 **`-vv` prints response bodies as they arrived**, and those routinely contain
-employee names, email addresses and masked card numbers. Read a log before
-pasting it into a ticket.
+employee names, email addresses and masked card numbers. It names the account
+whose data it is about to print, because that is what decides whether the log
+can be published. Read a log before pasting it into a ticket.
+
+## When something fails
+
+A failure prints the account it authenticated as, and — where the client cannot
+account for what happened — a fingerprint of the failure's shape:
+
+```
+account: aa_you_example_com (from OS keychain)
+defect fingerprint: EXP-9CAE0FE8  [export.reports exit=10 decode.json]
+```
+
+The fingerprint is derived from the command, the exit code and the error's
+discriminant, and from nothing that moves between releases, so the same defect
+answers the same token every time. Search issues for it exactly before filing:
+
+```console
+$ gh issue list --repo xrl/expensify-rs --search EXP-9CAE0FE8 --state all
+```
+
+Failures the client can account for — permissions, not found, rejected, rate
+limited, missing credentials, network — are not defects and carry no
+fingerprint.
 
 ## Credentials
 
@@ -51,6 +74,13 @@ the pair and not the other is an error rather than a fall-through, so a stale
 keychain entry can't silently pair with a fresh environment variable. Use the
 environment variables in CI — a runner has no keychain and `auth login` needs a
 TTY.
+
+Keychain access is granted per executable, so a binary the OS has not seen —
+**every `cargo build` produces one** — raises a permission prompt on its first
+read, and nothing outside an interactive session can answer it. The read is
+bounded accordingly: 10s with no terminal attached, 120s with one, then exit 3
+naming the ways out. `EXPENSIFY_KEYCHAIN_TIMEOUT_SECS` overrides the limit and
+`0` waits indefinitely.
 
 ## Agent skill
 

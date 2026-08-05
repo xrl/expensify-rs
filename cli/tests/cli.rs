@@ -321,3 +321,200 @@ fn the_verbosity_levels_are_documented() {
         assert!(help.contains(expected), "{help}");
     }
 }
+
+// ---- a server that answers wrongly on purpose -----------------------
+
+/// One request, one canned response, then the socket closes.
+///
+/// The whole request is drained before answering: closing on a half-written
+/// POST would surface as a transport failure, which is precisely the class of
+/// error these tests need to *not* get.
+fn answering(status: &str, content_type: &str, body: &'static str) -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("binding a port");
+    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(stream.try_clone().expect("cloning the socket"));
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap_or(0);
+            }
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let _ = reader.take(length as u64).read_to_end(&mut Vec::new());
+
+        let mut stream = stream;
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    });
+
+    endpoint
+}
+
+fn against(endpoint: &str, args: &[&str]) -> Output {
+    let mut argv = vec![
+        "--partner-user-id",
+        "aa_test_account_example_com",
+        "--partner-user-secret",
+        "test-secret-not-real",
+        "--endpoint",
+        endpoint,
+    ];
+    argv.extend_from_slice(args);
+    expensify(&argv)
+}
+
+fn line_starting(haystack: &str, prefix: &str) -> String {
+    haystack
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{haystack}"))
+        .to_owned()
+}
+
+/// The reason the fingerprint exists: an unreadable response is the defect
+/// worth filing, and it has to arrive with a token to file it under.
+#[test]
+fn an_unreadable_response_is_fingerprinted() {
+    let endpoint = answering("200 OK", "application/json", "this is not JSON");
+    let output = against(&endpoint, &["get", "policies"]);
+    let stderr = stderr(&output);
+
+    assert_eq!(code(&output), 10, "{stderr}");
+    assert_eq!(
+        line_starting(&stderr, "defect fingerprint:"),
+        "defect fingerprint: EXP-BAE7E423  [get.policies exit=10 decode.json]",
+        "{stderr}"
+    );
+}
+
+/// Stability is the property being bought, so it is checked across separate
+/// processes rather than inside one.
+#[test]
+fn one_defect_fingerprints_the_same_way_every_run() {
+    let first = answering("200 OK", "application/json", "this is not JSON");
+    let second = answering(
+        "200 OK",
+        "text/plain",
+        "also not JSON, and typed differently",
+    );
+
+    // Same defect, different message, different content-type, different run.
+    assert_eq!(
+        line_starting(&stderr(&against(&first, &["get", "policies"])), "defect"),
+        line_starting(&stderr(&against(&second, &["get", "policies"])), "defect"),
+    );
+}
+
+/// Two real defects must not land on one issue.
+#[test]
+fn different_defects_fingerprint_differently() {
+    let unreadable = answering("200 OK", "application/json", "this is not JSON");
+    let unplaceable = answering("502 Bad Gateway", "text/html", "<html>upstream</html>");
+    let unrecognized = answering("200 OK", "application/json", r#"{"somethingElse":1}"#);
+
+    let mut seen = std::collections::HashSet::new();
+    for endpoint in [&unreadable, &unplaceable, &unrecognized] {
+        let output = against(endpoint, &["get", "policies"]);
+        assert_eq!(code(&output), 10, "{}", stderr(&output));
+        assert!(
+            seen.insert(line_starting(&stderr(&output), "defect fingerprint:")),
+            "two failures share a fingerprint: {seen:?}"
+        );
+    }
+}
+
+/// A refusal, a usage error and a missing credential are not defects, and a
+/// fingerprint on them would be an invitation to file one.
+#[test]
+fn explained_failures_carry_no_fingerprint() {
+    let refused = answering(
+        "200 OK",
+        "application/json",
+        r#"{"responseCode":403,"responseMessage":"no"}"#,
+    );
+    for output in [
+        against(&refused, &["get", "policies"]),
+        // No keychain read here on purpose: half a pair fails before the
+        // resolver reaches one, so this stays the same speed everywhere.
+        expensify(&["--partner-user-id", "only-the-id", "get", "policies"]),
+        expensify(&["frobnicate"]),
+    ] {
+        assert!(
+            !stderr(&output).contains("defect fingerprint"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
+/// The skill has to decide whether a `-vv` body is safe to paste into a public
+/// issue, and the only thing that decides it is which account produced it.
+/// A second command to find out is a second command that may not be safe to
+/// run, so the failure itself has to say.
+#[test]
+fn a_failure_names_the_account_it_came_from() {
+    let endpoint = answering("200 OK", "application/json", "this is not JSON");
+    let stderr = stderr(&against(&endpoint, &["get", "policies"]));
+
+    assert_eq!(
+        line_starting(&stderr, "account:"),
+        "account: aa_test_account_example_com (from command-line flags)",
+        "{stderr}"
+    );
+    assert!(!stderr.contains("test-secret-not-real"), "{stderr}");
+}
+
+/// Including on a failure that is nobody's defect — the account is a fact
+/// about the run, not about the diagnosis.
+#[test]
+fn the_account_is_named_even_where_no_fingerprint_is() {
+    let output = against("http://127.0.0.1:1/", &["get", "policies"]);
+    let stderr = stderr(&output);
+    assert_eq!(code(&output), 9, "{stderr}");
+    assert!(
+        stderr.contains("account: aa_test_account_example_com"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("defect fingerprint"), "{stderr}");
+}
+
+/// A credential failure has no account to name, and saying so would be a
+/// guess about which half was wrong.
+#[test]
+fn a_credential_failure_names_no_account() {
+    let output = expensify(&["--partner-user-id", "only-the-id", "get", "policies"]);
+    assert_eq!(code(&output), 3);
+    assert!(!stderr(&output).contains("account:"), "{}", stderr(&output));
+}
+
+/// "May contain personal data" is true of every account and therefore decides
+/// nothing; which account is what decides whether to redact.
+#[test]
+fn the_verbose_warning_names_the_account_whose_data_it_prints() {
+    let output = against("http://127.0.0.1:1/", &["-vv", "get", "policies"]);
+    let stderr = stderr(&output);
+    assert!(stderr.contains("personal data"), "{stderr}");
+    assert!(stderr.contains("aa_test_account_example_com"), "{stderr}");
+    assert!(!stderr.contains("test-secret-not-real"), "{stderr}");
+}

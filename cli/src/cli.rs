@@ -849,6 +849,49 @@ pub enum PrimaryPolicyArg {
     AllEmployees,
 }
 
+/// A stable name for the command that ran, for the defect fingerprint.
+///
+/// Deliberately not derived from `argv`: flags, IDs and dates would all end up
+/// in it, and two runs of one command would fingerprint differently. These
+/// strings are a wire format between releases — rename a command and the old
+/// name stays here.
+pub fn path(command: &Command) -> &'static str {
+    match command {
+        Command::Auth { command } => match command {
+            AuthCommand::Login(_) => "auth.login",
+            AuthCommand::Status => "auth.status",
+            AuthCommand::Logout => "auth.logout",
+        },
+        Command::Get { command } => match command {
+            GetCommand::Policies(_) => "get.policies",
+            GetCommand::Policy(_) => "get.policy",
+            GetCommand::Cards(_) => "get.cards",
+        },
+        Command::Export { command } => match command {
+            ExportCommand::Reports(_) => "export.reports",
+            ExportCommand::Reconciliation(_) => "export.reconciliation",
+        },
+        Command::Download(_) => "download",
+        Command::Create { command } => match command {
+            CreateCommand::Policy(_) => "create.policy",
+            CreateCommand::Expenses(_) => "create.expenses",
+            CreateCommand::Report(_) => "create.report",
+            CreateCommand::ExpenseRule(_) => "create.expense-rule",
+        },
+        Command::Update { command } => match command {
+            UpdateCommand::Policy(_) => "update.policy",
+            UpdateCommand::TagApprovers(_) => "update.tag-approvers",
+            UpdateCommand::ExpenseRule(_) => "update.expense-rule",
+            UpdateCommand::Employees(_) => "update.employees",
+        },
+        Command::Reimburse(_) => "reimburse",
+        Command::Completion(_) => "completion",
+        Command::Skill { command } => match command {
+            SkillCommand::Install(_) => "skill.install",
+        },
+    }
+}
+
 /// Report a constraint clap cannot express the way clap reports its own:
 /// same styling, same usage line, same exit code.
 ///
@@ -869,6 +912,113 @@ mod tests {
     #[test]
     fn command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// Every leaf, because a leaf missing from `path` would fingerprint under
+    /// its neighbour's name — and because parsing these proves the argvs the
+    /// fingerprint scheme is described in terms of are real.
+    #[test]
+    fn every_leaf_has_its_own_stable_path() {
+        let leaves: &[&[&str]] = &[
+            &["auth", "login"],
+            &["auth", "status"],
+            &["auth", "logout"],
+            &["get", "policies"],
+            &["get", "policy", "P1", "--with-tags"],
+            &["get", "cards", "--domain", "acme.com"],
+            &[
+                "export",
+                "reports",
+                "--template",
+                "t.ftl",
+                "--since",
+                "2026-07-01",
+            ],
+            &[
+                "export",
+                "reconciliation",
+                "--domain",
+                "acme.com",
+                "--template",
+                "t.ftl",
+                "--start",
+                "2026-07-01",
+                "--end",
+                "2026-08-01",
+            ],
+            &["download", "export_8f3d.csv"],
+            &["create", "policy", "Engineering"],
+            &[
+                "create",
+                "expenses",
+                "--employee-email",
+                "a@acme.com",
+                "--merchant",
+                "M",
+                "--date",
+                "2026-07-01",
+                "--amount-cents",
+                "100",
+            ],
+            &[
+                "create",
+                "report",
+                "--policy-id",
+                "P1",
+                "--employee-email",
+                "a@acme.com",
+                "--title",
+                "T",
+                "--expenses",
+                "-",
+            ],
+            &[
+                "create",
+                "expense-rule",
+                "--policy-id",
+                "P1",
+                "--employee-email",
+                "a@acme.com",
+                "--tag",
+                "Core",
+            ],
+            &["update", "policy", "P1", "--categories", "-"],
+            &[
+                "update",
+                "tag-approvers",
+                "--policy-id",
+                "P1",
+                "--assign",
+                "Core=a@acme.com",
+            ],
+            &[
+                "update",
+                "expense-rule",
+                "--policy-id",
+                "P1",
+                "--employee-email",
+                "a@acme.com",
+                "--rule-id",
+                "1",
+                "--tag",
+                "Core",
+            ],
+            &["update", "employees", "--file", "-"],
+            &["reimburse", "--report-id", "R1"],
+            &["completion", "bash"],
+            &["skill", "install"],
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for leaf in leaves {
+            let argv: Vec<_> = std::iter::once("expensify")
+                .chain(leaf.iter().copied())
+                .collect();
+            let parsed = Cli::try_parse_from(&argv).unwrap_or_else(|err| panic!("{leaf:?}: {err}"));
+            let named = path(&parsed.command);
+            assert!(seen.insert(named), "{named} names more than one command");
+        }
+        assert_eq!(seen.len(), leaves.len());
     }
 
     #[test]

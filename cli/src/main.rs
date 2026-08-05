@@ -4,6 +4,7 @@ mod auth;
 mod cli;
 mod commands;
 mod error;
+mod fingerprint;
 mod observe;
 mod output;
 mod spec;
@@ -19,13 +20,13 @@ use tracing_subscriber::prelude::*;
 async fn main() -> ExitCode {
     let parsed = cli::Cli::parse();
     init_logging(parsed.global.verbose, parsed.global.quiet);
+    // Taken before the command consumes it: a failure has to be attributed to
+    // a command even when the command is what went missing.
+    let command = cli::path(&parsed.command);
 
     match commands::run(parsed).await {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error::report(&err);
-            ExitCode::from(error::exit_code(&err))
-        }
+        Err(err) => ExitCode::from(error::report(&err, command)),
     }
 }
 

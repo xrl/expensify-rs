@@ -83,6 +83,21 @@ ID, and `REIMBURSED` really is the only accepted report status.
   re-run under `-vv` and which have already had their server-side effect, and
   how to file the defect without republishing a credential or an employee's
   data. The library is unchanged.
+- CLI: the OS keychain is read under a timeout. Keychain access is granted per
+  executable, so a freshly built binary raises a permission prompt on its first
+  read; with nothing attached to answer it the process blocked forever printing
+  nothing at all. Bounded now at 120s with a terminal attached and 10s without,
+  with the wait itself announced after one second, and a failure that names
+  every way out. `EXPENSIFY_KEYCHAIN_TIMEOUT_SECS` overrides it; `0` restores
+  the old unbounded wait. The library is unchanged.
+- CLI: failures print the account that was authenticated as and, where the
+  client cannot account for what happened, a stable defect fingerprint
+  (`EXP-XXXXXXXX`) derived from the command, the exit code and the error's
+  discriminant. Neither the version nor any message text feeds it, so one
+  defect keeps one token across releases and issues can be deduplicated by
+  searching for it exactly. Failures Expensify or the CLI already explained
+  carry no fingerprint. `-vv` now names the account whose data it is about to
+  print. The library is unchanged; no new dependencies.
 
 ## 0.2.0 — 2026-08-04
 
