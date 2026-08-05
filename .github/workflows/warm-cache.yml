@@ -11,7 +11,7 @@ name: warm-cache
 # off the 10 GB cache ceiling, which PR-side saves had already pushed us to.
 on:
   push:
-    branches: [main, ci-build-caching] # TEMP: revert before merge
+    branches: [main]
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
