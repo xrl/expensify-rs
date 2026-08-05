@@ -73,6 +73,14 @@ pair with a fresh environment variable:
 never the secret. In CI use the environment variables: a runner has no keychain
 and `auth login` needs a TTY.
 
+The OS grants keychain access per *executable*, so a binary it has not seen —
+every `cargo build` produces one — raises a permission prompt on its first
+read. Nothing outside an interactive session can answer that prompt, so the
+read is bounded: 10s with no terminal attached, 120s with one, then exit 3
+naming the ways out. A command that pauses and then complains about the
+keychain wants `EXPENSIFY_PARTNER_USER_ID`/`_SECRET`, not a retry.
+`EXPENSIFY_KEYCHAIN_TIMEOUT_SECS` overrides the limit; `0` waits forever.
+
 ## Permissions you cannot grant yourself
 
 | Needs | Commands |
@@ -288,16 +296,55 @@ credentials redacted, response body verbatim, status and content-type. `-v` is
 a single summary line per call and too coarse; `-vvv` adds h2 frames and only
 helps when the connection, not the payload, is the suspect.
 
+### What a failure already tells you
+
+Under the message and the advice, a failure prints the two facts a report needs
+and a second command would have to go and fetch:
+
+```
+account: aa_xrlange_gmail_com (from OS keychain)
+defect fingerprint: EXP-9CAE0FE8  [export.reports exit=10 decode.json]
+```
+
+`account:` is the resolved partner user ID. It is the fact that decides whether
+a `-vv` body may be published — read it, do not infer it from which
+credentials you think were in scope.
+
+`defect fingerprint:` is derived from the command, the exit code and the
+error's discriminant, and from nothing that moves between releases: no version,
+no timestamp, no message text. The same defect answers the same token next
+month, which is what makes it searchable.
+
+Only failures this client cannot account for carry one — an unreadable
+response, an HTTP failure it could not place, a `responseCode` it does not
+classify, or an error that reached the top unexplained. Anything Expensify or
+the CLI already explained (permissions, not found, rejected, rate limited, no
+credentials, network) is not a defect and prints no fingerprint.
+
 ### Filing it
 
 Report the defect at `xrl/expensify-rs` with `gh issue create`, following
 `.github/ISSUE_TEMPLATE/cli-defect.md`.
 
-**Search first** — `gh issue list --repo xrl/expensify-rs --search "export
-reports decode" --state all`, keying on the operation and the symptom. This
-client is young and its defect list moves quickly, so what you just hit is
-quite likely filed already, or fixed on `main` and not yet released. Comment on
-that issue instead; a flood of near-duplicates is worse than no report.
+**Search on the fingerprint, exactly** — not on words:
+
+```console
+$ gh issue list --repo xrl/expensify-rs --search EXP-9CAE0FE8 --state all
+```
+
+Free text cannot dedup this: one agent searches "decode error on export", the
+next searches "expected value at line 1 column 1", and neither finds the
+other's issue. This client is young and its defect list moves quickly, so what
+you just hit is quite likely filed already, or fixed on `main` and not yet
+released — comment on what the token finds instead. Only a token that finds
+nothing is a new defect; put it in the title and the body so the next search
+lands.
+
+A failure with no fingerprint can still be worth filing — a 410 the CLI
+provoked by encoding something wrong looks like plain user error from here —
+but say that there was none. One known false positive in the other direction: a
+`download` run before rendering finished is exit 10 and does carry a
+fingerprint, and it is the documented retry signal, not a defect.
 
 Two leaks to close before you post, neither of which the CLI can close for you:
 
@@ -305,10 +352,11 @@ Two leaks to close before you post, neither of which the CLI can close for you:
   carrying `--partner-user-secret VALUE` publishes that credential if you
   reproduce it verbatim — replace the value.
 - **The repo is public and a `-vv` body is real data**: employee emails, card
-  numbers, merchant names. Name the account the trace came from. From a
-  throwaway trial account the full body is fine; from any account with real
-  people in it, redact the identifying fields and keep the shape, which is the
-  part that carries the diagnosis.
+  numbers, merchant names. The `account:` line names whose. From a throwaway
+  trial account the full body is fine; from any account with real people in it,
+  redact the identifying fields and keep the shape, which is the part that
+  carries the diagnosis. `-vv` says which account it is about to print before
+  it prints anything.
 
 ## Deliberately not offered
 

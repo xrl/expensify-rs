@@ -3,6 +3,7 @@
 use expensify::{ApiErrorKind, Error};
 
 use crate::auth::CredentialError;
+use crate::fingerprint;
 
 pub const EXIT_FAILURE: u8 = 1;
 pub const EXIT_NO_CREDENTIALS: u8 = 3;
@@ -38,8 +39,12 @@ pub fn exit_code(err: &anyhow::Error) -> u8 {
     }
 }
 
-/// One `error:` line, the cause chain, then advice where there is any.
-pub fn report(err: &anyhow::Error) {
+/// One `error:` line, the cause chain, advice where there is any, then the
+/// two facts a defect report needs and cannot be reconstructed without: whose
+/// account produced this, and what to file it under.
+///
+/// Returns the exit code, because the fingerprint is partly made of it.
+pub fn report(err: &anyhow::Error, command: &'static str) -> u8 {
     eprintln!("error: {err}");
     for cause in err.chain().skip(1) {
         eprintln!("  caused by: {cause}");
@@ -52,6 +57,28 @@ pub fn report(err: &anyhow::Error) {
         eprintln!();
         eprintln!("{advice}");
     }
+
+    let exit = exit_code(err);
+    // Absent when the failure was settled before any credential was resolved,
+    // which is also when there is no account to name.
+    let account = crate::auth::account();
+    let defect = fingerprint::identify(command, exit, err);
+    if account.is_some() || defect.is_some() {
+        eprintln!();
+    }
+    if let Some(account) = account {
+        // Not the secret, and not a secret: `auth status` prints it too. It
+        // decides whether a transcript is safe to publish.
+        eprintln!(
+            "account: {} (from {})",
+            account.partner_user_id,
+            account.source.describe()
+        );
+    }
+    if let Some(defect) = defect {
+        eprintln!("defect fingerprint: {defect}");
+    }
+    exit
 }
 
 /// What the user can actually do about it. `None` where the message above
