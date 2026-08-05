@@ -30,8 +30,10 @@ request against [`xrl/homebrew-tap`][tap] bumping `Formula/expensify-cli.rb`.
   and write` — nothing else
 - stored in this repo under *Settings → Secrets and variables → Actions*
 
-Fine-grained tokens expire. When it does, releases keep working and the tap job
-starts skipping — see below.
+Fine-grained tokens expire. An expired one fails the job rather than skipping it
+— the secret is still there, so the job cannot tell "not set up" from "set up
+wrong", and only the first of those is worth passing over in silence. crates.io
+and the release are untouched either way.
 
 An App installation token would avoid the expiry and the personal ownership, but
 costs an App registration, a private key to store and rotate, and a token-minting
