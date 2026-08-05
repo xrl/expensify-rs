@@ -5,6 +5,8 @@ use bytes::Bytes;
 use serde::de::DeserializeOwned;
 
 use crate::error::DecodeError;
+use crate::export::ExportFormat;
+use crate::reconciliation::ReconciliationFormat;
 
 /// How a downloaded export body is turned into a Rust value.
 ///
@@ -12,16 +14,21 @@ use crate::error::DecodeError;
 /// carried as a phantom parameter from template to exported file to
 /// download, so `Self::Output` can differ from `Self` (see [`Json`]).
 ///
-/// Open for user implementation (e.g. a CSV marker in the caller's crate):
+/// The two format consts are what the marker says its bytes are, and they
+/// supply each export job's default `fileExtension`. Both have a default of
+/// `Csv` — the server's own — so an impl that omits them behaves exactly as
+/// before; a marker for another format states it:
 ///
 /// ```
 /// use bytes::Bytes;
-/// use expensify::{DecodeError, FromExport};
+/// use expensify::{DecodeError, ExportFormat, FromExport};
 ///
 /// struct SemicolonCsv;
 ///
 /// impl FromExport for SemicolonCsv {
 ///     type Output = Vec<Vec<String>>;
+///
+///     // Omitted: EXPORT_FORMAT and RECONCILIATION_FORMAT both default to Csv.
 ///
 ///     fn from_export(bytes: Bytes) -> Result<Self::Output, DecodeError> {
 ///         let text = String::from_utf8(bytes.to_vec())?;
@@ -31,10 +38,40 @@ use crate::error::DecodeError;
 ///             .collect())
 ///     }
 /// }
+///
+/// struct Xml;
+///
+/// impl FromExport for Xml {
+///     type Output = String;
+///     const EXPORT_FORMAT: ExportFormat = ExportFormat::Xml;
+///
+///     fn from_export(bytes: Bytes) -> Result<String, DecodeError> {
+///         Ok(String::from_utf8(bytes.to_vec())?)
+///     }
+/// }
 /// ```
+///
+/// The two consts are separate because the two jobs accept different
+/// vocabularies: reconciliation has no `xls`/`xlsx`, so a marker for a
+/// spreadsheet can state a format for the exporter and leave reconciliation
+/// at the server default, which is the only truthful thing it can say.
 pub trait FromExport {
     /// What a download of this template's output resolves to.
     type Output: Send + 'static;
+
+    /// Default `outputSettings.fileExtension` for
+    /// [`Client::export_reports`](crate::Client::export_reports).
+    /// An explicit
+    /// [`ExportReportsAction::format`](crate::ExportReportsAction::format)
+    /// overrides it.
+    const EXPORT_FORMAT: ExportFormat = ExportFormat::Csv;
+
+    /// Default `outputSettings.fileExtension` for
+    /// [`DomainClient::reconcile`](crate::DomainClient::reconcile).
+    /// An explicit
+    /// [`ReconcileAction::format`](crate::ReconcileAction::format)
+    /// overrides it.
+    const RECONCILIATION_FORMAT: ReconciliationFormat = ReconciliationFormat::Csv;
 
     /// Decode one downloaded export body.
     fn from_export(bytes: Bytes) -> Result<Self::Output, DecodeError>;
@@ -61,14 +98,17 @@ impl FromExport for String {
 /// Marker for templates whose output is JSON deserializable into `T`.
 /// Never instantiated; exists only at the type level.
 ///
-/// The default [`ExportFormat`](crate::ExportFormat) is still
-/// [`Csv`](crate::ExportFormat::Csv), so a `Json<_>` template must also call
-/// `.format(ExportFormat::Json)` — the mismatch shows up as a decode error
-/// on download rather than as silently corrupt data.
+/// Exporting with this marker defaults `fileExtension` to `json`, so no
+/// `.format(ExportFormat::Json)` call is needed. An explicit `.format` still
+/// wins; asking for another format is then a stated contradiction, and the
+/// download reports it as one.
 pub struct Json<T>(PhantomData<fn() -> T>);
 
 impl<T: DeserializeOwned + Send + 'static> FromExport for Json<T> {
     type Output = T;
+
+    const EXPORT_FORMAT: ExportFormat = ExportFormat::Json;
+    const RECONCILIATION_FORMAT: ReconciliationFormat = ReconciliationFormat::Json;
 
     fn from_export(bytes: Bytes) -> Result<T, DecodeError> {
         serde_json::from_slice(&bytes).map_err(Into::into)

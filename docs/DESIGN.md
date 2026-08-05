@@ -68,8 +68,7 @@ let file = client
             .policy_ids([&policy])
             .not_yet_exported_as("acme-etl"))
     .state(ReportState::Approved)
-    .format(ExportFormat::Json)                // required: default is Csv for every marker
-    .mark_as_exported("acme-etl")
+    .mark_as_exported("acme-etl")              // no .format: the marker means json
     .await?;                                   // -> ExportedFile<Json<Vec<ReportRow>>>
 
 let rows: Vec<ReportRow> = client.download(&file).await?;   // typed by the file handle
@@ -349,13 +348,27 @@ phantom chain: **template → exported file → download result**.
 ```rust
 pub trait FromExport {                       // open for user impls (e.g. a Csv marker)
     type Output: Send + 'static;
+    const EXPORT_FORMAT: ExportFormat = ExportFormat::Csv;                  // defaulted
+    const RECONCILIATION_FORMAT: ReconciliationFormat = ReconciliationFormat::Csv;
     fn from_export(bytes: Bytes) -> Result<Self::Output, DecodeError>;
 }
 impl FromExport for Bytes  { type Output = Bytes; }    // escape hatch: raw bytes
 impl FromExport for String { type Output = String; }   // UTF-8
 pub struct Json<T>(PhantomData<fn() -> T>);            // marker, never instantiated
-impl<T: DeserializeOwned + Send + 'static> FromExport for Json<T> { type Output = T; }
+impl<T: DeserializeOwned + Send + 'static> FromExport for Json<T> {
+    type Output = T;
+    const EXPORT_FORMAT: ExportFormat = ExportFormat::Json;
+    const RECONCILIATION_FORMAT: ReconciliationFormat = ReconciliationFormat::Json;
+}
 ```
+
+The two consts are what a marker says its bytes *are*, and they supply each
+export job's default `fileExtension` (open question 5). Two rather than one
+because the jobs' vocabularies differ — reconciliation has no `xls`/`xlsx` —
+so a spreadsheet marker can state a format for the exporter and truthfully
+leave reconciliation at the server default, where one shared const would need
+a lossy conversion. Both are **defaulted**, which is what keeps the trait's
+open-for-user-impls promise: an existing impl compiles and behaves unchanged.
 
 `FromExport` lives on marker types so `Output` can differ from `Self` —
 `ExportedFile<Json<Vec<Row>>>` downloads to `Vec<Row>`, not
@@ -413,7 +426,7 @@ guarantee is "you will not do this by accident", not "you cannot do this".
 
 ```rust
 impl Client {
-    pub fn export_reports<F>(&self, template: &ExportTemplate<F>, query: ReportsQuery)
+    pub fn export_reports<F: FromExport>(&self, template: &ExportTemplate<F>, query: ReportsQuery)
         -> ExportReportsAction<F>;
     pub fn download<F: FromExport>(&self, file: &ExportedFile<F>) -> DownloadAction<F>;
 }
@@ -457,11 +470,32 @@ comma-joined), `.limit(u32)`, `.employee_email(..)` (doc: restricted),
 `.format(ExportFormat)`, `.file_basename(..)`,
 `.on_finish(impl Into<OnFinish>)` (repeatable),
 `.mark_as_exported(label)` (sugar for the common `OnFinish`),
-`.test_run()`. Default format is `Csv` for every template marker,
-including `Json<_>` — deriving it from `F` would need an associated const
-on `FromExport`, which open question 5 rules on. Until then a
-`Json<_>` template must call `.format(ExportFormat::Json)`; the mismatch
-surfaces as a decode error, not silent corruption.
+`.test_run()`. The default format is `F::EXPORT_FORMAT` — `json` for a
+`Json<_>` template, `csv` otherwise — read in `ExportReportsAction::new`,
+which is exactly where `F` is erased. `.format` is a later write to the
+same field, so an explicit call always wins.
+
+**An explicit `.format` that contradicts the marker is the caller's
+business.** `Json<T>` states how the downloaded bytes decode;
+`.format(ExportFormat::Csv)` states what to render. Both are things the
+caller said, and silently overriding the second one would be a worse
+failure than the one this closes. It is not made uncompilable either: a
+per-marker compatibility relation on `.format` would have to be added to
+`FromExport` and would forbid `Bytes`/`String` markers from choosing
+anything, which is most of the crate's real usage — a 21st compile-fail
+case buying less than the two it would break. What it gets instead is a
+better failure: `Client::download` compares the handle's filename
+extension with the marker's declared format and, on a decode error where
+they disagree, says so — naming the override rather than handing back
+`expected value at line 1 column 1`, which reads as an accusation against
+the FreeMarker source. A decode error whose extension *matches* passes
+through untouched, so real template bugs are not relabelled.
+
+Adding `F: FromExport` to `export_reports` and `reconcile` is technically
+breaking and practically not: an `ExportTemplate<F>` cannot be constructed
+without it (`new` fixes `F = Bytes`, `typed` requires the bound), so no
+reachable call site loses. Only a downstream generic passthrough
+`fn helper<F>(t: &ExportTemplate<F>)` would need the bound added.
 
 `OnFinish` constructors: `mark_as_exported(label)`,
 `email(recipients) -> EmailOnFinish` (`.message(text)`, `Into<OnFinish>`),
@@ -479,7 +513,8 @@ action, and of `EmployeeSource`.
 `start`, `end`, `ReconciliationScope::{Unreported, All}`; setters
 `.feed(name)` (default: all feeds), `.format(ReconciliationFormat)` — a
 separate four-variant enum, so the formats this job rejects are
-unrepresentable rather than server-rejected (misuse 18) —
+unrepresentable rather than server-rejected (misuse 18), defaulting to
+`F::RECONCILIATION_FORMAT` on the same rule as the exporter —
 `.email_on_finish(recipients)`. `async` is not
 exposed — only `false` is supported upstream, so there is no parameter
 (rule 3 of the talk: delete parameters with one useful value).
@@ -767,7 +802,8 @@ the reimburse job emits, and a per-op error enum for one job is worse.
 ### `template.rs` / `file.rs`
 
 Covered in [§ Exports](#exports-templates-files-download). Inventory:
-`FromExport` (open trait), `Json<T>` (marker), `ExportTemplate<F = Bytes>`,
+`FromExport` (open trait; two defaulted format consts), `Json<T>` (marker),
+`ExportTemplate<F = Bytes>`,
 `ReconciliationTemplate<F = Bytes>` (manual Clone/Debug),
 `FileSystem` (Clone, Copy, Debug, PartialEq, Eq, Hash, SD),
 `ExportedFile<F = Bytes>` (manual Clone/Debug; SD with
@@ -1206,7 +1242,9 @@ a probe; adding it back is additive, not a breaking change.
 - **Runtime-agnostic abstraction** — reqwest pins tokio; a runtime trait
   would be speculative complexity with one impl.
 - **`FromExport` sealing** — left open deliberately: user-side CSV/XML
-  markers are the escape hatch's escape hatch.
+  markers are the escape hatch's escape hatch. Its format consts are
+  defaulted for the same reason — a required const would break every
+  existing user impl to save the crate a `= ExportFormat::Csv`.
 - **A third `FetchState` for the dynamic getter** (`Dynamic`, with
   `Wrap<T> = Option<T>`, making `DynamicPolicy` just `Policy<Dynamic, ..>`).
   Tempting — it reuses `Policy` and the existing `IntoFuture` outright — and
@@ -1323,10 +1361,20 @@ unconfirmed.
    the setter could only ever be a no-op. A live probe of the response
    shape decides whether this returns as `Vec<ExportedFile>` or as a
    plain variant.
-5. **`ExportFormat` default for `Json<_>` templates** — doc'd default is
-   Csv for all; auto-defaulting typed-JSON exports to `json` needs an
-   associated const on `FromExport` (small trait wart). Rule on whether
-   the ergonomic win justifies it.
+5. ~~**`ExportFormat` default for `Json<_>` templates.**~~ **Answered: the
+   marker decides.** `FromExport` gained `EXPORT_FORMAT` and
+   `RECONCILIATION_FORMAT`, both defaulted to `Csv`, and each export action
+   reads its own in the constructor. The "small trait wart" objection was
+   the wrong trade: the ergonomic win is not the point — the type system
+   held the one fact that would have prevented the failure and declined to
+   use it, and the failure landed at *download*, after the export had run
+   server-side and `onFinish` had fired. This design doc's own running
+   example shipped without the `.format` call. Two consts rather than one
+   because the two jobs' format vocabularies differ; defaulted rather than
+   required because the trait is deliberately open for user markers. An
+   explicit `.format` still wins — see [§ Exports](#exports-templates-files-download)
+   for why the resulting contradiction is the caller's to make, and what
+   the download error says when they make it.
 6. **Rate-limit figures** — if the "50 jobs/minute" page resurfaces,
    confirm whether it's a separate *job-start* budget on top of the
    request budget; the limiter currently models requests only.

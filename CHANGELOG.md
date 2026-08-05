@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+Recommended: **expensify 0.4.0**. Pre-1.0 a minor bump is the breaking-change
+signal, and this changes observable behaviour rather than adding to it — a
+`Json<_>` export that relied on the CSV default now renders JSON. Nobody
+plausibly relied on it (the pairing was already a decode failure at download),
+but "nobody plausibly does" is not the same as additive, and the two added
+trait bounds are a second, smaller reason.
+
+### The export format now comes from the template's type
+
+`ExportTemplate<Json<Vec<Row>>>` said the template emits JSON and the crate
+sent `fileExtension: "csv"` anyway, so a caller who forgot
+`.format(ExportFormat::Json)` got CSV bytes fed to a JSON decoder — and found
+out at **download**, after the export had run server-side and any `onFinish`
+had fired. `docs/DESIGN.md`'s own running example shipped without that call.
+
+- `FromExport` gains `EXPORT_FORMAT: ExportFormat` and
+  `RECONCILIATION_FORMAT: ReconciliationFormat`. `Json<T>` sets both to
+  `Json`; `Bytes` and `String` keep `Csv`. Each export action reads the one
+  for its job as its default.
+- **Both consts are defaulted to `Csv`**, so existing user markers compile and
+  behave unchanged. The trait stays open for them.
+- **An explicit `.format()` still wins**, including where it contradicts the
+  marker. That contradiction is the caller's to make; what changed is that
+  the resulting decode failure now names it. `Client::download` compares the
+  file's extension with the marker's format and, when they disagree, reports
+  the override instead of `expected value at line 1 column 1` — which read as
+  an accusation against the FreeMarker source. A decode error whose extension
+  matches is passed through untouched.
+- `Error::Decode` now renders its source (`decode error: json: …`) rather than
+  the bare `decode error`, which is what the rest of the crate's docs already
+  claimed it did.
+
+**Breaking:** `Client::export_reports` and `DomainClient::reconcile` gain an
+`F: FromExport` bound. Technically breaking, practically not — an
+`ExportTemplate<F>` cannot be constructed without it, so only a downstream
+generic passthrough would need the bound added.
+
+Closes `docs/DESIGN.md` open question 5, which had rejected this as "a small
+trait wart".
+
 ## expensify 0.3.0 / expensify-cli 0.2.0 — 2026-08-05
 
 **Breaking.** Four public library signatures change shape (below). Everything

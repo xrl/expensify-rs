@@ -11,5 +11,5 @@ error[E0308]: mismatched types
 note: method defined here
   --> src/client.rs
    |
-   |     pub fn reconcile<F>(
+   |     pub fn reconcile<F: FromExport>(
    |            ^^^^^^^^^

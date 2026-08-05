@@ -5,7 +5,7 @@
 #![allow(clippy::inconsistent_digit_grouping)]
 
 use expensify::{
-    Client, Credentials, Expense, ExpenseTax, ExportFormat, ExportTemplate, Json, Money, PolicyId,
+    Client, Credentials, Expense, ExpenseTax, ExportTemplate, Json, Money, PolicyId,
     ReimburseTargets, ReportId, ReportState, ReportsQuery,
 };
 use serde::Deserialize;
@@ -38,8 +38,7 @@ async fn month_end_close(client: &Client, policy: PolicyId) -> Result<(), expens
                 .not_yet_exported_as("acme-etl"),
         )
         .state(ReportState::Approved)
-        // The default is csv for every marker, including Json<_>.
-        .format(ExportFormat::Json)
+        // No `.format`: the Json<_> marker already means `fileExtension: json`.
         .mark_as_exported("acme-etl")
         .await?;
 

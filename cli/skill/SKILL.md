@@ -155,7 +155,9 @@ $ jq -r '.[] | "\(.report_id) \(.total_cents)"' july.json
 ```
 
 `--format` defaults to `csv` for *every* template, including one that emits
-JSON. Set it explicitly or the file's bytes will not match its extension.
+JSON. Set it explicitly or the file's bytes will not match its extension. (The
+library derives the default from the template's type parameter instead; the CLI
+has no typed templates, so it cannot.)
 
 `download` writes raw bytes to stdout and ignores `-o`; use `-O PATH` for
 anything binary (`xls`, `xlsx`).

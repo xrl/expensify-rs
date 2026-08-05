@@ -101,7 +101,7 @@ impl Client {
 
     /// Report Exporter. Resolves to an [`ExportedFile`] handle; pass it to
     /// [`Client::download`] to fetch the rendered output.
-    pub fn export_reports<F>(
+    pub fn export_reports<F: FromExport>(
         &self,
         template: &ExportTemplate<F>,
         query: ReportsQuery,
@@ -469,7 +469,7 @@ impl DomainClient {
     ///
     /// Requires domain-admin credentials for this domain; Expensify
     /// answers 403 otherwise.
-    pub fn reconcile<F>(
+    pub fn reconcile<F: FromExport>(
         &self,
         template: &ReconciliationTemplate<F>,
         start: Date,

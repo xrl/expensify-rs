@@ -114,7 +114,7 @@ fn report_state(state: ReportState) -> &'static str {
     }
 }
 
-fn export_format(format: ExportFormat) -> &'static str {
+pub(crate) fn export_format(format: ExportFormat) -> &'static str {
     match format {
         ExportFormat::Csv => "csv",
         ExportFormat::Xls => "xls",
@@ -125,7 +125,7 @@ fn export_format(format: ExportFormat) -> &'static str {
     }
 }
 
-fn reconciliation_format(format: ReconciliationFormat) -> &'static str {
+pub(crate) fn reconciliation_format(format: ReconciliationFormat) -> &'static str {
     match format {
         ReconciliationFormat::Csv => "csv",
         ReconciliationFormat::Txt => "txt",
@@ -869,7 +869,7 @@ pub(crate) fn export_reports<F>(action: &ExportReportsAction<F>) -> JobRequest {
     let mut output = Map::new();
     output.insert(
         "fileExtension".to_owned(),
-        json!(export_format(action.format.unwrap_or(ExportFormat::Csv))),
+        json!(export_format(action.format)),
     );
     opt!(output, "fileBasename", action.file_basename);
 
@@ -929,8 +929,7 @@ pub(crate) fn reconcile<F>(action: &ReconcileAction<F>) -> JobRequest {
         .set(
             "outputSettings",
             json!({
-                "fileExtension":
-                    reconciliation_format(action.format.unwrap_or(ReconciliationFormat::Csv))
+                "fileExtension": reconciliation_format(action.format)
             }),
         )
         .template(&action.template);
@@ -1884,16 +1883,90 @@ mod tests {
         );
     }
 
+    /// The marker's format must reach the wire without a `.format` call —
+    /// once per marker, because the const is per impl.
     #[test]
-    fn export_defaults_to_csv_even_for_json_templates() {
+    fn export_format_defaults_to_the_template_marker() {
+        fn extension<F: crate::FromExport>(template: &crate::ExportTemplate<F>) -> String {
+            let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+            let action = client.export_reports(template, ReportsQuery::report_ids(["R1"]));
+            export_reports(&action).description()["outputSettings"]["fileExtension"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        assert_eq!(extension(&crate::ExportTemplate::new("x")), "csv");
+        assert_eq!(
+            extension(&crate::ExportTemplate::<String>::typed("x")),
+            "csv"
+        );
+        assert_eq!(
+            extension(&crate::ExportTemplate::<crate::Json<Vec<u8>>>::typed("x")),
+            "json"
+        );
+    }
+
+    /// An explicit `.format` is a statement of intent and outranks the
+    /// marker, even where the two contradict each other.
+    #[test]
+    fn an_explicit_export_format_overrides_the_marker() {
         let client = crate::Client::new(crate::Credentials::new("id", "secret"));
         let template: crate::ExportTemplate<crate::Json<Vec<u8>>> =
             crate::ExportTemplate::typed("x");
-        let action = client.export_reports(&template, ReportsQuery::report_ids(["R1"]));
-        let request = export_reports(&action);
+        let action = client
+            .export_reports(&template, ReportsQuery::report_ids(["R1"]))
+            .format(ExportFormat::Csv);
         assert_eq!(
-            request.description()["outputSettings"]["fileExtension"],
+            export_reports(&action).description()["outputSettings"]["fileExtension"],
             "csv"
+        );
+    }
+
+    #[test]
+    fn reconciliation_format_defaults_to_the_template_marker() {
+        fn extension<F: crate::FromExport>(template: &crate::ReconciliationTemplate<F>) -> String {
+            let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+            let action = client.domain("acme.com").reconcile(
+                template,
+                date!(2026 - 07 - 01),
+                date!(2026 - 07 - 31),
+                ReconciliationScope::All,
+            );
+            reconcile(&action).description()["outputSettings"]["fileExtension"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+
+        assert_eq!(extension(&crate::ReconciliationTemplate::new("x")), "csv");
+        assert_eq!(
+            extension(&crate::ReconciliationTemplate::<String>::typed("x")),
+            "csv"
+        );
+        assert_eq!(
+            extension(&crate::ReconciliationTemplate::<crate::Json<Vec<u8>>>::typed("x")),
+            "json"
+        );
+    }
+
+    #[test]
+    fn an_explicit_reconciliation_format_overrides_the_marker() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let template: crate::ReconciliationTemplate<crate::Json<Vec<u8>>> =
+            crate::ReconciliationTemplate::typed("x");
+        let action = client
+            .domain("acme.com")
+            .reconcile(
+                &template,
+                date!(2026 - 07 - 01),
+                date!(2026 - 07 - 31),
+                ReconciliationScope::All,
+            )
+            .format(ReconciliationFormat::Txt);
+        assert_eq!(
+            reconcile(&action).description()["outputSettings"]["fileExtension"],
+            "txt"
         );
     }
 

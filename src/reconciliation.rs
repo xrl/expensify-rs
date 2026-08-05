@@ -6,7 +6,7 @@ use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::file::{ExportedFile, FileSystem};
-use crate::template::ReconciliationTemplate;
+use crate::template::{FromExport, ReconciliationTemplate};
 use crate::wire;
 
 /// `inputSettings.type` of the reconciliation job.
@@ -53,12 +53,12 @@ pub struct ReconcileAction<F> {
     pub(crate) end: Date,
     pub(crate) scope: ReconciliationScope,
     pub(crate) feed: Option<String>,
-    pub(crate) format: Option<ReconciliationFormat>,
+    pub(crate) format: ReconciliationFormat,
     pub(crate) email_on_finish: Option<String>,
     _out: PhantomData<fn() -> F>,
 }
 
-impl<F> ReconcileAction<F> {
+impl<F: FromExport> ReconcileAction<F> {
     pub(crate) fn new(
         client: Client,
         domain: String,
@@ -75,12 +75,15 @@ impl<F> ReconcileAction<F> {
             end,
             scope,
             feed: None,
-            format: None,
+            // Read at the one point `F` is still known; `.format` overrides.
+            format: F::RECONCILIATION_FORMAT,
             email_on_finish: None,
             _out: PhantomData,
         }
     }
+}
 
+impl<F> ReconcileAction<F> {
     /// Restrict to one card feed. Default: all feeds
     /// (`"export_all_feeds"`).
     pub fn feed(mut self, feed: impl Into<String>) -> Self {
@@ -88,9 +91,12 @@ impl<F> ReconcileAction<F> {
         self
     }
 
-    /// Default: [`ReconciliationFormat::Csv`].
+    /// Override the format the template marker implies
+    /// ([`FromExport::RECONCILIATION_FORMAT`](crate::FromExport::RECONCILIATION_FORMAT):
+    /// `json` for [`Json`](crate::Json), `csv` otherwise). An explicit call
+    /// always wins.
     pub fn format(mut self, format: ReconciliationFormat) -> Self {
-        self.format = Some(format);
+        self.format = format;
         self
     }
 
