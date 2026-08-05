@@ -302,7 +302,7 @@ Under the message and the advice, a failure prints the two facts a report needs
 and a second command would have to go and fetch:
 
 ```
-account: aa_xrlange_gmail_com (from OS keychain)
+account: aa_you_example_com (from OS keychain)
 defect fingerprint: EXP-9CAE0FE8  [export.reports exit=10 decode.json]
 ```
 
