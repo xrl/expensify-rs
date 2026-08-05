@@ -54,9 +54,9 @@ job — it is idempotent.
 
 The PR lists the three digests and links the release. It is opened, never pushed
 to the tap's `main`, because a bad formula breaks `brew install` for everyone and
-this path runs unattended. Before merging, confirm the digests match the release
-assets, and that `brew audit --strict --online expensify-cli` and `brew install
---build-from-source` are clean — the tap has no CI of its own.
+this path runs unattended. The tap has no CI of its own, so before merging, check
+out the branch and run the same loop the bump used to be: `brew audit --strict
+--online ./Formula/expensify-cli.rb`, then `brew install` and `brew test` it.
 
 The formula deliberately carries no `version` stanza; brew scans the version out
 of the url, and `brew audit --strict` rejects having both.
