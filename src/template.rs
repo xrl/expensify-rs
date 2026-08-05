@@ -15,7 +15,7 @@ use crate::reconciliation::ReconciliationFormat;
 /// download, so `Self::Output` can differ from `Self` (see [`Json`]).
 ///
 /// The two format consts are what the marker says its bytes are, and they
-/// supply the export job's default `fileExtension`. Both have a default of
+/// supply each export job's default `fileExtension`. Both have a default of
 /// `Csv` — the server's own — so an impl that omits them behaves exactly as
 /// before; a marker for another format states it:
 ///
