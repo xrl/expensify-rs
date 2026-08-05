@@ -125,31 +125,25 @@ impl Expense {
 }
 
 /// Expense Creator (`type: "create"`, `inputSettings.type: "expenses"`).
+///
+/// The employee the expenses belong to is a required argument of
+/// [`Client::create_expenses`](crate::Client::create_expenses), not a setter:
+/// Expensify rejects the job without it (410, `'employeeEmail' parameter is
+/// missing or malformed`), with or without a policy on the expenses.
 #[must_use = "actions do nothing until awaited"]
 pub struct CreateExpensesAction {
     pub(crate) client: Client,
     pub(crate) expenses: Vec<Expense>,
-    pub(crate) employee_email: Option<String>,
+    pub(crate) employee_email: String,
 }
 
 impl CreateExpensesAction {
-    pub(crate) fn new(client: Client, expenses: Vec<Expense>) -> Self {
+    pub(crate) fn new(client: Client, employee_email: String, expenses: Vec<Expense>) -> Self {
         Self {
             client,
             expenses,
-            employee_email: None,
+            employee_email,
         }
-    }
-
-    /// Create in another user's account. Default: the credential owner's
-    /// account.
-    ///
-    /// Restricted: Expensify must grant the credential advanced
-    /// permissions, otherwise the job fails with
-    /// [`ApiErrorKind::InvalidPermissions`](crate::ApiErrorKind::InvalidPermissions).
-    pub fn employee_email(mut self, email: impl Into<String>) -> Self {
-        self.employee_email = Some(email.into());
-        self
     }
 }
 

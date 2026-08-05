@@ -32,11 +32,12 @@ impl ExpenseLine {
 
 /// Report Creator (`type: "create"`, `inputSettings.type: "report"`).
 ///
-/// Restricted: Expensify support must enable report creation for the
-/// domain, and the credentials need both domain-admin and policy-admin
-/// rights. A persistent "Not authorized to authenticate as user"
-/// [`Error::Api`] means it is not enabled — no amount of client-side
-/// correctness will fix it.
+/// Expensify's docs say support must enable report creation for the domain.
+/// That requirement is **unconfirmed**: the job worked immediately on a trial
+/// account with policy-admin rights and no unlock (observed 2026-08-04). One
+/// account is not proof it never applies — a persistent "Not authorized to
+/// authenticate as user" [`Error::Api`] is still worth asking support about,
+/// since no amount of client-side correctness will fix it.
 #[must_use = "actions do nothing until awaited"]
 pub struct CreateReportAction {
     pub(crate) client: Client,
@@ -167,29 +168,29 @@ impl ReimburseTargets {
     }
 }
 
-/// Strict mode marker (default): a 207 partial success is an error.
+/// Strict mode marker (default): any partial success is an error.
 pub struct Strict;
 
-/// Tolerant mode marker: a 207 partial success is an `Ok` outcome.
+/// Tolerant mode marker: a partial success is an `Ok` outcome.
 pub struct Tolerant;
 
 /// Report Status Updater (`type: "update"`, `inputSettings.type:
 /// "reportStatus"`). The only supported transition is Approved →
 /// Reimbursed, so there is no status parameter.
 ///
-/// By default a 207 (some reports skipped/failed) is
-/// [`Error::PartialSuccess`]; [`ReimburseAction::tolerate_partial`]
-/// switches the output type to the full [`ReimburseOutcome`] instead.
+/// By default any skipped or failed report is [`Error::PartialSuccess`];
+/// [`ReimburseAction::tolerate_partial`] switches the output type to the full
+/// [`ReimburseOutcome`] instead.
 ///
-/// # Unverified: partial success may not always be a 207
-///
-/// Expensify's docs say non-Approved reports "will be ignored", without
-/// stating that this always produces a 207. If a run can ignore reports
-/// under a plain 200, then the strict path's `Vec<ReportId>` can come back
-/// **shorter than the request** and still be `Ok` — indistinguishable from
-/// full success, which is the exact bug the strict/tolerant split exists to
-/// close. Until that is confirmed against a live account, compare the
-/// returned IDs against the ones you asked for if the distinction matters.
+/// **Strictness is keyed on the lists, not on the response code**, because
+/// the response code does not carry the information. Both partial runs
+/// observed live (2026-08-04) came back `responseCode: 200` — one with every
+/// report skipped and `reportIDs: []`, one mixed, with a single reimbursed ID
+/// beside two skips. Treating 207 as the signal of partial success, which the
+/// docs imply and this crate did, made the first `Ok(vec![])` and the second
+/// an `Ok` of one ID indistinguishable from a run that fully succeeded, with
+/// every reason discarded. 207 is still honoured; it has just never been
+/// seen.
 #[must_use = "actions do nothing until awaited"]
 pub struct ReimburseAction<Mode = Strict> {
     client: Client,
@@ -209,7 +210,8 @@ impl ReimburseAction<Strict> {
     }
 
     /// Accept partial success: skipped and failed reports become data in
-    /// the [`ReimburseOutcome`] rather than an error.
+    /// the [`ReimburseOutcome`] rather than an error. Read both lists —
+    /// Expensify reports a run in which nothing moved as a plain 200.
     pub fn tolerate_partial(self) -> ReimburseAction<Tolerant> {
         ReimburseAction {
             client: self.client,
@@ -265,14 +267,16 @@ pub struct ReimburseOutcome {
 }
 
 impl IntoFuture for ReimburseAction<Strict> {
-    /// The updated report IDs. A 207 becomes [`Error::PartialSuccess`].
+    /// The updated report IDs. Any skipped or failed report — or a 207 —
+    /// becomes [`Error::PartialSuccess`], so an `Ok` means every targeted
+    /// report moved.
     type Output = Result<Vec<ReportId>, Error>;
     type IntoFuture = BoxFuture<Self::Output>;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             let (partial, outcome) = self.run().await?;
-            if partial {
+            if partial || !outcome.skipped.is_empty() || !outcome.failed.is_empty() {
                 return Err(Error::PartialSuccess(Box::new(outcome)));
             }
             Ok(outcome.updated)
@@ -281,7 +285,7 @@ impl IntoFuture for ReimburseAction<Strict> {
 }
 
 impl IntoFuture for ReimburseAction<Tolerant> {
-    /// Both 200 and 207 resolve to the outcome.
+    /// The full outcome, whatever the response code.
     type Output = Result<ReimburseOutcome, Error>;
     type IntoFuture = BoxFuture<Self::Output>;
 

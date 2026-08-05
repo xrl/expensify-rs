@@ -165,12 +165,13 @@ pub(crate) enum TagsSource {
 
 /// Tag section of a Policy Updater request.
 ///
-/// Replace-only, unlike [`CategoriesUpdate`] and [`ReportFieldsUpdate`]:
-/// Expensify's inline-tags parameter table documents no `action` key and its
-/// prose says a tags update "replaces the existing tags of the policy", so a
-/// `merge_*` constructor here could not be trusted to merge. A `merge` that
-/// may delete every unlisted tag is exactly what this crate's naming exists
-/// to prevent, so it is withheld until a live account confirms otherwise.
+/// Replace-only, unlike [`CategoriesUpdate`] and [`ReportFieldsUpdate`], and
+/// now confirmed to be the only honest spelling. Sending one tag with
+/// `action: "merge"` against a policy holding two others **deleted both**,
+/// and answered `{"responseCode":200}` with no warning (observed live
+/// 2026-08-04). A `merge_*` constructor would therefore be a `replace_all_*`
+/// under a name that promises the opposite, which is precisely what this
+/// crate's naming exists to prevent.
 #[derive(Clone, Debug)]
 pub struct TagsUpdate {
     pub(crate) mode: UpdateMode,

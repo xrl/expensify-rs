@@ -60,12 +60,10 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
     };
 
     let client = client(global)?;
-    let mut action = client.create_expenses(expenses);
-    if let Some(email) = &args.employee_email {
-        action = action.employee_email(email);
-    }
-
-    let created = action.await.context("creating expenses")?;
+    let created = client
+        .create_expenses(&args.employee_email, expenses)
+        .await
+        .context("creating expenses")?;
 
     View::new(
         "expenses",
