@@ -318,8 +318,11 @@ async fn json_template_round_trips_to_typed_rows() {
     );
 }
 
+/// The one mismatch the marker default cannot close: the caller overrode it.
+/// The error has to name that, not the template — the bare serde message
+/// reads as an accusation against the FreeMarker source.
 #[tokio::test]
-async fn json_template_decode_failure_is_a_decode_error() {
+async fn an_overridden_format_is_named_as_the_cause_of_the_decode_failure() {
     let server = MockServer::start().await;
     Mock::given(JobType("file"))
         .respond_with(
@@ -329,8 +332,41 @@ async fn json_template_decode_failure_is_a_decode_error() {
         .mount(&server)
         .await;
     Mock::given(JobType("download"))
-        // What a Json<_> template gets when the format defaulted to csv.
         .respond_with(ResponseTemplate::new(200).set_body_string("report_id,total\nR1,129\n"))
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let template: ExportTemplate<Json<Vec<ReportRow>>> = ExportTemplate::typed("...");
+    let file = client
+        .export_reports(&template, ReportsQuery::report_ids(["R1"]))
+        .format(ExportFormat::Csv)
+        .await
+        .unwrap();
+
+    let err = client.download(&file).await.unwrap_err();
+    assert!(matches!(err, Error::Decode(_)), "{err:?}");
+    let rendered = err.to_string();
+    for expected in ["close_1.csv", "`csv`", "`json`", "`.format`"] {
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+}
+
+/// A decode failure that is *not* a format mismatch keeps the original
+/// error; the annotation must not swallow real template bugs.
+#[tokio::test]
+async fn a_matching_extension_leaves_the_decode_error_alone() {
+    let server = MockServer::start().await;
+    Mock::given(JobType("file"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"responseCode": 200, "filename": "close_1.json"})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(JobType("download"))
+        // Truncated JSON: the template really is broken.
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"[{"report_id":"R1","#))
         .mount(&server)
         .await;
 
@@ -341,10 +377,8 @@ async fn json_template_decode_failure_is_a_decode_error() {
         .await
         .unwrap();
 
-    assert!(matches!(
-        client.download(&file).await.unwrap_err(),
-        Error::Decode(_)
-    ));
+    let rendered = client.download(&file).await.unwrap_err().to_string();
+    assert!(!rendered.contains("`.format`"), "{rendered}");
 }
 
 // ---------------------------------------------------------------------------

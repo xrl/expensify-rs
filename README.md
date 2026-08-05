@@ -16,7 +16,7 @@ field. This crate turns that into typed operations where the compiler knows
 which response shape comes back.
 
 ```rust
-use expensify::{Client, Credentials, ExportFormat, ExportTemplate, Json, ReportsQuery};
+use expensify::{Client, Credentials, ExportTemplate, Json, ReportsQuery};
 use serde::Deserialize;
 use time::macros::date;
 
@@ -28,12 +28,12 @@ struct ReportRow {
 
 let client = Client::new(Credentials::new(partner_user_id, partner_user_secret));
 
-// The template's type parameter decides what `download` gives you back.
+// The template's type parameter decides what `download` gives you back —
+// and what the export asks Expensify to render (`fileExtension: json` here).
 let template: ExportTemplate<Json<Vec<ReportRow>>> = ExportTemplate::typed(TEMPLATE_SRC);
 
 let file = client
     .export_reports(&template, ReportsQuery::since(date!(2026 - 07 - 01)))
-    .format(ExportFormat::Json)   // the default is Csv for every template type
     .mark_as_exported("acme-etl")
     .await?;
 

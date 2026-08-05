@@ -43,7 +43,7 @@ pub enum Error {
 
     /// Failed to decode a response body or a downloaded export
     /// (via [`crate::FromExport`]).
-    #[error("decode error")]
+    #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
 
     /// Some reports were updated, others skipped or failed. Raised whenever

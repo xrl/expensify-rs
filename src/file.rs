@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::BoxFuture;
 use crate::client::Client;
-use crate::error::Error;
+use crate::error::{DecodeError, Error};
 use crate::template::FromExport;
 use crate::wire;
 
@@ -132,9 +132,39 @@ impl<F: FromExport> IntoFuture for DownloadAction<F> {
         Box::pin(async move {
             let request = wire::download(&self.name, self.file_system);
             let bytes = self.client.send_download(request).await?;
-            F::from_export(bytes).map_err(Into::into)
+            F::from_export(bytes)
+                .map_err(|err| blame_the_format::<F>(&self.name, self.file_system, err))
         })
     }
+}
+
+/// The format a marker declares for the job that produced `file_system`.
+fn declared_extension<F: FromExport>(file_system: FileSystem) -> &'static str {
+    match file_system {
+        FileSystem::IntegrationServer => wire::export_format(F::EXPORT_FORMAT),
+        FileSystem::Reconciliation => wire::reconciliation_format(F::RECONCILIATION_FORMAT),
+    }
+}
+
+/// A decode failure on a file whose extension disagrees with the marker is
+/// almost always an overridden `.format`, not a broken template. Say so —
+/// the bare serde error ("expected value at line 1 column 1") reads as an
+/// accusation against the FreeMarker source, which is the wrong place to
+/// look. Every other case passes through untouched.
+fn blame_the_format<F: FromExport>(name: &str, file_system: FileSystem, err: DecodeError) -> Error {
+    let declared = declared_extension::<F>(file_system);
+    let Some(actual) = name.rsplit_once('.').map(|(_, ext)| ext) else {
+        return err.into();
+    };
+    if actual.eq_ignore_ascii_case(declared) {
+        return err.into();
+    }
+    DecodeError::custom(format!(
+        "`{name}` is a `{actual}` file but this handle's template marker decodes `{declared}`; \
+         the export ran with an explicit `.format` that overrode the marker. Match them, or \
+         download the handle's `untyped()` form for raw bytes. Underlying error: {err}"
+    ))
+    .into()
 }
 
 #[cfg(test)]

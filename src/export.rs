@@ -7,7 +7,7 @@ use crate::client::Client;
 use crate::error::Error;
 use crate::file::{ExportedFile, FileSystem};
 use crate::secret::Secret;
-use crate::template::ExportTemplate;
+use crate::template::{ExportTemplate, FromExport};
 use crate::types::{PolicyId, ReportId};
 use crate::wire;
 
@@ -255,14 +255,14 @@ pub struct ExportReportsAction<F> {
     pub(crate) states: Vec<ReportState>,
     pub(crate) limit: Option<u32>,
     pub(crate) employee_email: Option<String>,
-    pub(crate) format: Option<ExportFormat>,
+    pub(crate) format: ExportFormat,
     pub(crate) file_basename: Option<String>,
     pub(crate) on_finish: Vec<OnFinish>,
     pub(crate) test: bool,
     _out: PhantomData<fn() -> F>,
 }
 
-impl<F> ExportReportsAction<F> {
+impl<F: FromExport> ExportReportsAction<F> {
     pub(crate) fn new(client: Client, template: &ExportTemplate<F>, query: ReportsQuery) -> Self {
         Self {
             client,
@@ -271,14 +271,19 @@ impl<F> ExportReportsAction<F> {
             states: Vec::new(),
             limit: None,
             employee_email: None,
-            format: None,
+            // The marker is the only statement of intent available at this
+            // point, and `F` is erased right here — so this is where it is
+            // read. `.format` below still overrides it.
+            format: F::EXPORT_FORMAT,
             file_basename: None,
             on_finish: Vec::new(),
             test: false,
             _out: PhantomData,
         }
     }
+}
 
+impl<F> ExportReportsAction<F> {
     /// Restrict by report state; repeatable (`reportState` is
     /// comma-separated on the wire). Default: all states.
     pub fn state(mut self, state: ReportState) -> Self {
@@ -303,10 +308,15 @@ impl<F> ExportReportsAction<F> {
         self
     }
 
-    /// Default: [`ExportFormat::Csv`] for every template marker, including
-    /// [`Json`](crate::Json) — the format is not derived from the marker.
+    /// Override the format the template marker implies
+    /// ([`FromExport::EXPORT_FORMAT`](crate::FromExport::EXPORT_FORMAT):
+    /// `json` for [`Json`](crate::Json), `csv` otherwise).
+    ///
+    /// An explicit call always wins, including where it contradicts the
+    /// marker. Downloading such an export fails, but with an error that
+    /// names the contradiction rather than the template.
     pub fn format(mut self, format: ExportFormat) -> Self {
-        self.format = Some(format);
+        self.format = format;
         self
     }
 
