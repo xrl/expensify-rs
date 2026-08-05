@@ -46,9 +46,11 @@ pub enum Error {
     #[error("decode error")]
     Decode(#[from] DecodeError),
 
-    /// responseCode 207: some reports were updated, others skipped or
-    /// failed. Only produced by the strict (default) reimbursement path;
-    /// `tolerate_partial()` turns this into an `Ok` outcome instead.
+    /// Some reports were updated, others skipped or failed. Raised whenever
+    /// either list is non-empty — Expensify sends a full set of skips under
+    /// a plain `responseCode: 200`, so the code is not the signal — and on a
+    /// 207 regardless. Only produced by the strict (default) reimbursement
+    /// path; `tolerate_partial()` turns this into an `Ok` outcome instead.
     #[error("partial success: {} updated, {} skipped, {} failed",
             .0.updated.len(), .0.skipped.len(), .0.failed.len())]
     PartialSuccess(Box<ReimburseOutcome>),

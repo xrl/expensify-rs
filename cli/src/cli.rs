@@ -416,9 +416,10 @@ pub enum CreateCommand {
 
     /// Create a report from expense lines
     #[command(
-        long_about = "Create a report from expense lines.\n\nRestricted: Expensify \
-                      support must enable report creation for the domain, and the \
-                      credentials need domain-admin and policy-admin rights."
+        long_about = "Create a report from expense lines.\n\nExpensify documents this \
+                      as needing an unlock from support plus domain-admin rights, but \
+                      it worked on a policy-admin account with neither. Treat the \
+                      requirement as unconfirmed, not absent."
     )]
     Report(CreateReportArgs),
 
@@ -499,9 +500,9 @@ pub struct CreateExpensesArgs {
     #[arg(long, value_name = "BOOL", num_args = 0..=1, default_missing_value = "true")]
     pub reimbursable: Option<bool>,
 
-    /// Create in another user's account; needs advanced permissions
+    /// Employee the expenses belong to; Expensify requires it
     #[arg(long, value_name = "EMAIL")]
-    pub employee_email: Option<String>,
+    pub employee_email: String,
 }
 
 #[derive(Debug, Args)]
@@ -553,9 +554,9 @@ pub enum UpdateCommand {
     /// Update a policy's categories, report fields or tags
     #[command(
         long_about = "Update a policy's categories, report fields or tags.\n\n\
-                      Tags are replace-only: Expensify's documentation says a tags \
-                      update replaces the policy's tags, so this CLI offers no merge \
-                      that might delete unlisted tags. Categories and report fields \
+                      Tags are replace-only: a tags update sent with action=merge was \
+                      observed deleting every unlisted tag and reporting success, so \
+                      this CLI offers no tag merge. Categories and report fields \
                       default to merging."
     )]
     Policy(UpdatePolicyArgs),

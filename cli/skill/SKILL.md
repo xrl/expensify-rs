@@ -21,10 +21,12 @@ One binary over Expensify's single-endpoint Integration Server API. Verb-noun
 commands (`expensify get policies`, `expensify export reports`), `-o json` on
 every read, exit codes listed in `expensify --help`.
 
-**The wire format has never been verified against a live Expensify account.**
-Every field name and value type is derived from Expensify's prose docs — there
-is no OpenAPI spec. Treat a surprising response as a plausible client bug, not
-as user error.
+**Most of the wire format is derived from Expensify's prose docs, not from a
+live account** — there is no OpenAPI spec. Eleven response shapes have now been
+confirmed against a real account (2026-08-04) and five documented claims turned
+out to be wrong; `docs/DESIGN.md` § Verification status says which is which.
+Anything still marked inferred is a guess, so treat a surprising response as a
+plausible client bug, not as user error.
 
 ## Before you run anything
 
@@ -34,7 +36,7 @@ as user error.
 |---|---|
 | `export reports --mark-as-exported LABEL` | Permanently labels the exported reports. `--not-exported-as LABEL` then skips them on every later run. This API has no unmark. |
 | `reimburse` | A real financial state change, Approved → Reimbursed. It is the only transition Expensify offers; there is no way back. |
-| `update policy --tags` / `--tags-csv` | **Replaces** every tag on the policy. Tags not in the file are deleted. |
+| `update policy --tags` / `--tags-csv` | **Replaces** every tag on the policy. Tags not in the file are deleted — confirmed live, silently and under a 200. |
 | `update policy --categories-mode replace-all`, `--report-fields-mode replace-all` | Deletes every category / report field not in the file. Default is `merge`; only ask for `replace-all` deliberately. |
 | `export reports --email`, `export reconciliation --email-on-finish` | Actually sends mail to real people. |
 | `update employees` | Moves people between policies and rewrites approval chains. `--dry-run` first — it reports what would change without changing it. |
@@ -77,7 +79,13 @@ and `auth login` needs a TTY.
 |---|---|
 | policy admin | `get policy --with-employees` / `--with-tax`, `update policy`, `update tag-approvers` |
 | domain admin | `get cards`, `export reconciliation`, `update employees` |
-| an unlock from Expensify support | `create report` (support must enable report creation for the domain); `--employee-email` / `--on-behalf-of` anywhere (third-party access grant) |
+| possibly an unlock from Expensify support | `create report`; `--on-behalf-of` anywhere (third-party access grant) |
+
+`create report` is documented as needing that unlock and domain-admin rights,
+and worked on a policy-admin account with neither — so the requirement is
+unconfirmed rather than absent. `create expenses --employee-email` is likewise
+documented as restricted, and creating expenses for the credential owner's own
+address needed no grant.
 
 Exit 4 is a flat refusal — check the credential pair's account roles. A
 *server* error (exit 1) on `create report` or `--on-behalf-of` usually means
@@ -173,9 +181,10 @@ result prints `No <noun> found.` on **stderr** with nothing on stdout, so
 // reimburse --tolerate-partial
 {"updated":["R1"],"skipped":[{"report_id":"R2","reason":"not approved"}],"failed":[]}
 
-// create expenses — array
-[{"transaction_id":"T1","merchant":"Cloud Hosting Inc","date":"2026-07-31",
-  "amount_cents":12900,"currency":"USD"}]
+// create expenses — array. `report_id` is the report Expensify put the
+// expense in, which it opens for you if the expense named none.
+[{"transaction_id":"T1","report_id":"R009WqAY45L1","merchant":"Cloud Hosting Inc",
+  "date":"2026-07-31","amount_cents":12900,"currency":"USD"}]
 
 // writes Expensify answers with no body (create expense-rule, update policy, ...)
 {"result":"created a rule for a@acme.com on 1234ABCD"}
@@ -225,13 +234,24 @@ strictly `YYYY-MM-DD` — `07/01/2026` is a usage error.
   is a usage error (exit 2), not a silent no-op.
 - Date windows may not exceed a year, and an end date becomes *required* once
   the start anchor is over a year old.
-- `create expense-rule` returns no rule ID — Expensify documents no response
-  body. `update expense-rule --rule-id N` therefore needs an ID you have to get
-  from somewhere else. Plan for that before creating rules you intend to edit.
-- `reimburse` treats a partially applied run as an error (exit 8). Add
-  `--tolerate-partial` to get the `updated`/`skipped`/`failed` breakdown as
-  data instead. Expensify may also report a partial run as a plain success, in
-  which case neither mode can detect it.
+- `create expense-rule` returns no rule ID — the live response is only
+  `{"responseMessage":"OK","responseCode":200}`. `update expense-rule
+  --rule-id N` therefore needs an ID from somewhere else, and the one known
+  source is an accident: re-creating an identical rule answers the
+  undocumented `responseCode 666`, `Rule already exists with those actions,
+  please update rule N`. Plan for that before creating rules you intend to edit.
+- `create expenses` requires `--employee-email`. It does not default to the
+  credential owner; without it Expensify answers 410.
+- `create expenses` without `--report-id` does not leave the expense loose:
+  Expensify opens a report for it. The `report_id` column names that report,
+  and it is the only way to find the expense without a separate export. It has
+  been present on every observed response but is typed nullable on purpose —
+  if it is ever `null` the expense was still created, so treat a missing
+  report ID as "look it up", never as a failure to retry.
+- `reimburse` treats a partially applied run as an error (exit 8) — including
+  the case Expensify reports as a plain `responseCode: 200` with every report
+  skipped, which it does. Add `--tolerate-partial` to get the
+  `updated`/`skipped`/`failed` breakdown as data instead; read both lists.
 - Rate limits are 5 requests / 10 s and 20 / 60 s. The CLI paces itself
   automatically; `--no-rate-limit` opts out. The limiter is per-process, so
   several processes sharing one credential pair still need pacing of their own.
@@ -298,9 +318,9 @@ account confirms the behaviour:
 - **PDF export.** `--format` has no `pdf`. Expensify emits one PDF *per report*
   and a single file handle cannot name several files, so a PDF export would
   silently hand back a fraction of the data.
-- **Tag merging.** `update policy --tags*` replaces only. Expensify's docs
-  document no `action` key for tags and say a tags update replaces them, so a
-  `merge` mode might delete every unlisted tag.
+- **Tag merging.** `update policy --tags*` replaces only, and this one is not
+  coming back: a tags update sent with `action: "merge"` was observed deleting
+  every unlisted tag and answering `{"responseCode":200}` with no warning.
 - **SFTP and URL employee feeds.** The library supports both; the CLI does not,
   because the password would sit in `argv` where any `ps` can read it. Use
   `--file` or stdin.

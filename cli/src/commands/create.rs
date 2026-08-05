@@ -60,17 +60,16 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
     };
 
     let client = client(global)?;
-    let mut action = client.create_expenses(expenses);
-    if let Some(email) = &args.employee_email {
-        action = action.employee_email(email);
-    }
-
-    let created = action.await.context("creating expenses")?;
+    let created = client
+        .create_expenses(&args.employee_email, expenses)
+        .await
+        .context("creating expenses")?;
 
     View::new(
         "expenses",
         vec![
             "TRANSACTION ID",
+            "REPORT ID",
             "MERCHANT",
             "DATE",
             "AMOUNT CENTS",
@@ -81,6 +80,11 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
             .map(|transaction| {
                 vec![
                     transaction.transaction_id.to_string(),
+                    transaction
+                        .report_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     transaction.merchant.clone(),
                     transaction.created.to_string(),
                     transaction.amount_cents.to_string(),

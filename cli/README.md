@@ -62,11 +62,13 @@ stdout instead if you want to read it first.
 
 ## Status
 
-The wire format has **not been verified against a live Expensify account** —
-Expensify publishes no OpenAPI spec, so every field name and value type is
-derived from their prose documentation. Some operations are deliberately
-withheld rather than shipped half-known; `expensify <command> --help` says which
-and why.
+The wire format is **only partly verified against a live Expensify account** —
+Expensify publishes no OpenAPI spec, so most field names and value types are
+derived from their prose documentation. A dozen response shapes have been
+recorded live and five documented claims were wrong; the library's
+`docs/DESIGN.md` § Verification status says which is which. Some operations are
+deliberately withheld rather than shipped half-known; `expensify <command>
+--help` says which and why.
 
 Treat a surprising response as a plausible client bug rather than user error,
 and please report it.

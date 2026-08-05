@@ -2,8 +2,59 @@
 
 ## Unreleased
 
-**Breaking — the next library release must be 0.3.0, not 0.2.1.** Three public
+**Breaking — the next library release must be 0.3.0, not 0.2.1.** Four public
 signatures change shape (below). Everything else here is additive.
+
+### Fixed against the live API
+
+Five behaviours were probed against a real Expensify account and did not match
+the documentation they were built from. `docs/DESIGN.md` § Verification status
+now records, per response shape, whether it is observed, a doc example, or
+inference; the recorded bodies are replayed in `tests/replay.rs`.
+
+- **The Report Exporter answers a bare filename, not a JSON envelope**, so
+  `export_reports` — the crate's flagship operation — failed every time with
+  `expected value at line 1 column 1`. The documented
+  `{"responseCode":200,"filename":…}` shape is reconciliation's and had been
+  generalized. The exporter now accepts either, discriminating on the body's
+  shape; content-type is not consulted, because this endpoint sends JSON as
+  `text/plain` for some jobs and as `application/json` for others.
+  Reconciliation's own shape remains unconfirmed.
+- **Reimbursement reports partial success under `responseCode: 200`**, not
+  207 — both when every report is skipped and when some succeed. Strict mode
+  keyed on 207, so it returned `Ok` and discarded the skip reasons, breaking
+  the guarantee it exists to make. It now fails whenever `skippedReports` or
+  `failedReports` is non-empty, whatever the code. `tolerate_partial()` is
+  unchanged.
+- **`employeeEmail` is required when creating expenses.** Breaking:
+  `Client::create_expenses(employee_email, expenses)` takes it as an argument
+  and `CreateExpensesAction::employee_email` is gone. It does not default to
+  the credential owner; without it Expensify answers 410. CLI:
+  `create expenses --employee-email` is now required.
+- **Report creation needs no unlock from Expensify support** — documented as
+  requiring one, it worked on a policy-admin trial account. Documentation
+  only; the claim is now stated as unconfirmed rather than asserted.
+- **Tag "merge" is destructive**, confirmed: sending one tag with
+  `action: "merge"` deleted the two unlisted ones and answered
+  `{"responseCode":200}`. `TagsUpdate` was already replace-only on suspicion;
+  that decision is now permanent and has a compile-fail case.
+
+Also observed: the expense-rules creator returns no rule ID (so `()` is
+right), the undocumented `responseCode: 666` is the only way to learn a rule's
+ID, and `REIMBURSED` really is the only accepted report status.
+
+- **`CreatedTransaction::report_id: Option<ReportId>`** — new field, recording
+  an undocumented side effect: an expense created without `Expense::report_id`
+  is not left loose. Expensify opens a report for it and names it in the
+  response, which this crate was discarding, so a caller could not find their
+  own expense without a separate export. The CLI prints it as a `REPORT ID`
+  column and a `report_id` key. `Option` even though every observed response
+  carries it: the expense exists by the time the response is decoded, so a
+  missing key must not turn a created expense into an error nobody can act on
+  or safely retry. Technically breaking for anyone destructuring or
+  struct-literal-constructing `CreatedTransaction`, which 0.3.0 already is.
+
+### Everything else
 
 - `Secret<T>` and `MaskedUrl`: redaction is now carried by the field's type
   rather than by a hand-written `Debug` on each holder. `Debug`/`Display`

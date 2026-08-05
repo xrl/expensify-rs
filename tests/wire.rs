@@ -154,6 +154,10 @@ async fn body_code_429_is_rate_limited() {
 // export -> download, and the fileSystem that must reach the wire
 // ---------------------------------------------------------------------------
 
+/// The envelope form of the exporter's submit response. Expensify has only
+/// ever been seen answering a bare filename (`tests/replay.rs`); this shape is
+/// the documented one and is still accepted, which is why the two decisions —
+/// what the file system is, and how the name arrived — stay independent.
 #[tokio::test]
 async fn export_then_download_sends_integration_server() {
     let server = MockServer::start().await;
@@ -778,17 +782,20 @@ async fn expense_creator_parses_the_transaction_list() {
         "responseCode": 200,
         "transactionList": [
             { "amount": 12900, "merchant": "Cloud Hosting Inc", "created": "2026-07-31",
-              "transactionID": "T123", "currency": "USD" }
+              "transactionID": "T123", "reportID": "R1", "currency": "USD" }
         ]
     })))
     .await;
 
     let created = client(&server)
-        .create_expenses([expensify::Expense::new(
-            "Cloud Hosting Inc",
-            date!(2026 - 07 - 31),
-            expensify::Money::new(12_900, "USD"),
-        )])
+        .create_expenses(
+            "ap@acme.com",
+            [expensify::Expense::new(
+                "Cloud Hosting Inc",
+                date!(2026 - 07 - 31),
+                expensify::Money::new(12_900, "USD"),
+            )],
+        )
         .await
         .unwrap();
 

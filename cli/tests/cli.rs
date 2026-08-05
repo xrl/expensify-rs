@@ -145,6 +145,24 @@ fn hand_checked_constraints_exit_as_usage_errors() {
     }
 }
 
+/// Expensify answers 410 without `employeeEmail` and does not fall back to
+/// the credential owner, so the flag is required rather than a nicety.
+#[test]
+fn creating_expenses_requires_an_employee() {
+    let output = expensify(&[
+        "create",
+        "expenses",
+        "--merchant",
+        "Cloud Hosting Inc",
+        "--date",
+        "2026-07-31",
+        "--amount-cents",
+        "12900",
+    ]);
+    assert_eq!(code(&output), 2);
+    assert!(stderr(&output).contains("--employee-email"), "{output:?}");
+}
+
 #[test]
 fn a_bad_date_names_the_expected_format() {
     let output = expensify(&["reimburse", "--since", "07/01/2026"]);

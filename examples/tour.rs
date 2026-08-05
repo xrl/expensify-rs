@@ -52,16 +52,20 @@ async fn month_end_close(client: &Client, policy: PolicyId) -> Result<(), expens
         );
     }
 
-    // 3. Book July's hosting bill as an expense.
+    // 3. Book July's hosting bill as an expense. The employee is required:
+    //    Expensify does not default it to the credential owner.
     let created = client
-        .create_expenses([Expense::new(
-            "Cloud Hosting Inc",
-            date!(2026 - 07 - 31),
-            Money::new(129_00, "USD"),
+        .create_expenses(
+            "ap@acme.com",
+            [Expense::new(
+                "Cloud Hosting Inc",
+                date!(2026 - 07 - 31),
+                Money::new(129_00, "USD"),
+            )
+            .category("Infrastructure")
+            .external_id("hosting-2026-07")
+            .tax(ExpenseTax::new("id_TAX_OPTION_16"))],
         )
-        .category("Infrastructure")
-        .external_id("hosting-2026-07")
-        .tax(ExpenseTax::new("id_TAX_OPTION_16"))])
         .await?;
     println!("created {} transactions", created.len());
 

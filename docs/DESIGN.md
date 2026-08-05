@@ -14,6 +14,12 @@ and `doc/employeeUpdater/`, read 2026-08-04. No OpenAPI spec exists (the
 deprecation signal from Expensify; treat the wire layer as the part most
 likely to need maintenance and keep it in one module (`wire.rs`).
 
+A dozen response shapes have since been probed against a live account, and
+five documented claims turned out to be wrong — including the flagship export, which had
+never worked. [§ Verification status](#verification-status) says which shapes
+are observed, which are doc examples, and which are still inference; read it
+before trusting anything below that is not marked observed.
+
 Corrections/refinements to the pre-read map, verified against the docs:
 
 - Exporter `inputSettings.filters` is required and needs at least one of
@@ -68,7 +74,7 @@ let file = client
 
 let rows: Vec<ReportRow> = client.download(&file).await?;   // typed by the file handle
 
-client.create_expenses([
+client.create_expenses("ap@acme.com", [       // required: there is no default
     Expense::new("Cloud Hosting Inc", date!(2026-07-31), Money::new(129_00, "USD"))
         .category("Infrastructure")
         .external_id("hosting-2026-07"),
@@ -121,11 +127,22 @@ updater is `multipart/form-data`). Form fields:
 | `data` | employee feeds (advanced: urlencoded; deprecated: multipart) |
 
 Responses are JSON with `responseCode` (and `responseMessage` on error)
-**even under HTTP 200** — body code wins. Exception: a successful
-Downloader response body is the raw file, not JSON; the implementer must
-treat non-200 HTTP or a JSON error envelope as failure and everything
-else as file content. All of this lives in `wire.rs` (private); public
-types carry serde attrs only where the mapping is 1:1.
+**even under HTTP 200** — body code wins. **Two jobs are exceptions**, and
+both discriminate on the shape of the body rather than on any header:
+
+- the Downloader, whose success body is the raw file — non-200 HTTP or a JSON
+  error envelope is failure, everything else is file content;
+- the Report Exporter, whose success body is the bare generated filename
+  (`export0fd99e06-….csv`, no JSON at all). A JSON object is an envelope —
+  an error, or the documented shape if it ever arrives — and anything else is
+  the name, accepted only if it looks like one (non-empty, single line).
+
+**Content-type is not a discriminator anywhere.** The same endpoint answers
+JSON as `text/plain;charset=utf-8` (expense rules, reimburse) and as
+`application/json` (policy creator), and answers the exporter's bare filename
+as `text/plain;charset=utf-8` too. Keying on it would have looked like it
+worked. All of this lives in `wire.rs` (private); public types carry serde
+attrs only where the mapping is 1:1.
 
 Wire mapping notes: all JSON keys camelCase (`#[serde(rename_all)]` or
 explicit renames); amounts are integer cents; `reportState` is a
@@ -411,6 +428,14 @@ the handle; rendering continues server-side (poll by downloading —
 no ready-signal exists, see Open questions). Reconciliation is
 synchronous, so its handle is immediately downloadable.
 
+The two answer that handle **differently**, which is the correction that made
+`export_reports` work at all. The exporter sends the filename as a bare body;
+reconciliation's documented `{"responseCode":200,"filename":…}` is what this
+crate had generalized to both. Reconciliation's own shape is still
+unconfirmed — probing it needs a domain-admin credential nobody here has — so
+it keeps the documented envelope, now known not to be a shape the exporter
+shares.
+
 `ReportsQuery` (anchored constructors: there is no way to *spell* an empty
 filter set — a documented 410 — though an empty iterator can still produce
 one, see [§ Misuses](#misuses-made-uncompilable) entry 7):
@@ -608,11 +633,11 @@ one uses, so a section that was requested and did not come back is the same
 `get_policies` stays the documented default; `get_policies_dynamic`'s rustdoc
 says outright that it reintroduces the `unwrap` and names the case it is for.
 
-## Reimbursement: strict vs tolerant 207
+## Reimbursement: strict vs tolerant partial success
 
-`responseCode: 207` means partial success. The silent-partial bug — code
-assumes everything was reimbursed and never looks at `skippedReports` —
-is closed with the `verbose_results` move applied to error strictness:
+The silent-partial bug — code assumes everything was reimbursed and never
+looks at `skippedReports` — is closed with the `verbose_results` move applied
+to error strictness:
 
 ```rust
 impl Client { pub fn mark_reports_reimbursed(&self, targets: ReimburseTargets) -> ReimburseAction<Strict> }
@@ -622,10 +647,27 @@ pub struct ReimburseAction<Mode = Strict>;              // .payment_source(..) o
 impl ReimburseAction<Strict> { pub fn tolerate_partial(self) -> ReimburseAction<Tolerant> }
 
 impl IntoFuture for ReimburseAction<Strict>   { type Output = Result<Vec<ReportId>, Error>; }
-    // 207 -> Err(Error::PartialSuccess(Box<ReimburseOutcome>)); Ok has no lists to forget to check
+    // non-empty skipped/failed (or 207) -> Err(Error::PartialSuccess(Box<..>));
+    // Ok has no lists to forget to check
 impl IntoFuture for ReimburseAction<Tolerant> { type Output = Result<ReimburseOutcome, Error>; }
-    // 200 and 207 both Ok
+    // whatever the code, the outcome is Ok
 ```
+
+**Strictness is keyed on the lists, not on `responseCode`, and that is not a
+belt-and-braces choice — it is the only thing that works.** Both observed
+partial runs came back **200**: three Open reports with everything skipped and
+`reportIDs: []`, and a mixed batch of one Approved plus two Open with
+`reportIDs: ["R00X9oNOn2MO"]` and two `skippedReports`. Expensify has not been
+seen answering 207 at all. Keying on 207 — which the docs imply, and which
+this crate did — made the first case `Ok(vec![])` and the second
+`Ok(["R00X9oNOn2MO"])`: success, with every skip reason discarded, and in the
+mixed case indistinguishable from a one-report run that worked. The 207 branch
+is kept because the docs describe it and it costs nothing, but it is dead code
+against every response seen so far.
+
+`failedReports` is **absent** from both bodies rather than `[]`, so it
+deserializes with `#[serde(default)]`. Hand-written mocks tend to include the
+key; the replayed fixtures do not, which is how that stays honest.
 
 ```rust
 pub struct ReimburseTargets;   // anchored: report_ids(..) | since(Date); .until(Date)
@@ -651,7 +693,7 @@ Expensify accepts, so the method name *is* the status.
 | Domain Cards Getter (`get`/`domainCardList`) | `DomainClient::card_list()` | `DomainCardListAction` | `Vec<DomainCard>` |
 | Policy Creator (`create`/`policy`) | `Client::create_policy(name)` | `CreatePolicyAction` | `CreatedPolicy` |
 | Report Creator (`create`/`report`) | `Client::create_report(policy, email, title, expenses)` | `CreateReportAction` | `CreatedReport` |
-| Expense Creator (`create`/`expenses`) | `Client::create_expenses(expenses)` | `CreateExpensesAction` | `Vec<CreatedTransaction>` |
+| Expense Creator (`create`/`expenses`) | `Client::create_expenses(employee_email, expenses)` | `CreateExpensesAction` | `Vec<CreatedTransaction>` |
 | Expense Rules Creator (`create`/`expenseRules`) | `Client::create_expense_rule(policy, email)` | `CreateExpenseRuleAction` | `()` |
 | Expense Rules Updater (`update`/`expenseRules`) | `Client::update_expense_rule(policy, email, RuleId)` | `UpdateExpenseRuleAction` | `()` |
 | Policy Updater (`update`/`policy`) | `Client::update_policy(id)` / `update_policies(ids)` | `UpdatePolicyAction` | `()` |
@@ -821,8 +863,9 @@ private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
   `.with_gl_codes()`, `.with_header_row()`, `.tsv()`; `TagsUpdate` —
   `replace_all_inline` (independent levels only — the inline form simply
   has no dependency knob, matching the API) and `replace_all_csv(data,
-  config)` (the CSV goes in the `file` form field), **replace-only** while
-  open question 9 is unresolved; `UpdatePolicyAction` — `.categories()`,
+  config)` (the CSV goes in the `file` form field), **replace-only —
+  permanently**, now that `action: "merge"` is confirmed destructive
+  (open question 9); `UpdatePolicyAction` — `.categories()`,
   `.report_fields()`, `.tags()`, each optional and independent.
 - `approvers.rs` — `TagApprover::assign(tag, email)` /
   `TagApprover::clear(tag)` (clearing is an explicit constructor, not the
@@ -836,10 +879,36 @@ private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
   `external_id`, `category`, `tag`, `billable(bool)`,
   `reimbursable(bool)`, `comment`, `report_id(impl Into<ReportId>)`,
   `policy_id(..)`, `tax(ExpenseTax)`. Clone, Debug; fields private.
-- `CreateExpensesAction` — `.employee_email(..)` (doc'd: restricted,
-  needs advanced permissions; default = credential owner's account).
-- `CreatedTransaction { transaction_id, merchant, created: Date,
-  amount_cents, currency }` — Clone, Debug.
+- `CreateExpensesAction` — no setters. `employee_email` is a **required
+  argument** of `create_expenses`: Expensify answers 410 (`'employeeEmail'
+  parameter is missing or malformed`) without it, with or without a policy on
+  the expenses, and does not fall back to the credential owner as the docs
+  say. The same docs call the parameter restricted and needing advanced
+  permissions; a plain policy-admin trial account used it with no grant, so
+  that claim is suspect too.
+- `CreatedTransaction { transaction_id, report_id: Option<ReportId>, merchant,
+  created: Date, amount_cents, currency }` — Clone, Debug. `report_id` records
+  an **undocumented side effect**: an expense created without
+  `Expense::report_id` is not left loose — Expensify opens a report for it and
+  names that report in the response. Discarding it left callers unable to find
+  their own expense without a separate export.
+
+  `Option`, though it has been present on every observed response, and this is
+  the one place in this crate where a request-independent field is optional on
+  purpose rather than because absence is data. The rule elsewhere — a value
+  that should be there and is not is a `DecodeError`, never a silent `None` —
+  assumes a decode failure means the caller got nothing. Here it means the
+  opposite: **the expense already exists** by the time this decodes. Requiring
+  the field would turn a created expense into an error that the caller can
+  neither act on nor safely retry (retrying duplicates it), over a field
+  describing a side effect rather than the transaction. `None` costs them the
+  report's name and nothing else. `tests/replay.rs` covers the branch no
+  recorded body can.
+
+  The response also carries `comment`, `tag`, `category` and `mcc`, which only
+  echo the request (or Expensify's default for it, e.g. `"Uncategorized"`) and
+  are not modelled; no wire struct sets `deny_unknown_fields`, so a response
+  that grows a field does not fail a created expense.
 
 ### `reports.rs`
 
@@ -850,12 +919,14 @@ private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
 - `CreateReportAction` — `.report_field(name, value)` (repeatable),
   `.report_fields(&impl Serialize)` (must serialize to a JSON object;
   serialized eagerly, failure surfaces at `.await`). Keys normalized
-  (non-alphanumeric → `_`) before sending. Doc'd: job requires
-  support-side enablement + domain/policy admin.
+  (non-alphanumeric → `_`) before sending. The docs say the job requires
+  support-side enablement + domain/policy admin; it worked immediately on a
+  trial account with policy-admin rights and no unlock, so that requirement is
+  **unconfirmed** rather than disproved — one account is not a general rule.
   `CreatedReport { report_id, name }`.
 - `ReimburseTargets`, `Strict`, `Tolerant`, `ReimburseAction<Mode>`,
   `ReimburseOutcome`, `SkippedReport` — see
-  [§ Reimbursement](#reimbursement-strict-vs-tolerant-207).
+  [§ Reimbursement](#reimbursement-strict-vs-tolerant-partial-success).
 
 ### `expense_rules.rs`
 
@@ -1032,8 +1103,15 @@ Each entry is a `trybuild` case under `tests/ui/` with a committed
    is sent.
 8. **Silently ignoring partial reimbursement**: strict output is
    `Vec<ReportId>` — `outcome.skipped` is E0609; there is no list to
-   forget, and an actual 207 is `Err`. Reaching `ReimburseOutcome`
-   requires typing `.tolerate_partial()`.
+   forget. Reaching `ReimburseOutcome` requires typing `.tolerate_partial()`.
+   **The type half was never the leaky half.** The runtime half — deciding
+   *when* to withhold that `Ok` — keyed on `responseCode == 207`, and
+   Expensify answers partial runs with 200, so the strict path returned a
+   short `Ok(Vec<ReportId>)` and discarded the reasons. Fixed by keying on the
+   skipped/failed lists; see
+   [§ Reimbursement](#reimbursement-strict-vs-tolerant-partial-success). The
+   compile error quoted here is unchanged, which is exactly why it never
+   caught this.
 9. **Any report-status value other than reimbursed**: no status
    parameter exists to hold `"APPROVED"` (E0599 on any invented method).
 10. **Rich expense fields on the report creator** (would be silently
@@ -1072,6 +1150,10 @@ Each entry is a `trybuild` case under `tests/ui/` with a committed
     `&*secret` is E0614, "type `Secret` cannot be dereferenced". `expose()`
     is the only read path, which is what makes every use of a secret
     greppable — and what lets the wire layer be the only place that calls it.
+20. **Merging policy tags.** `TagsUpdate::merge_inline(..)` — E0599; the
+    constructors are `replace_all_*` only. Withheld on suspicion in 0.1.0,
+    kept on evidence: `action: "merge"` deleted every unlisted tag and
+    answered `{"responseCode":200}`.
 
 Runtime-but-loud (not compile errors, by design): empty collections are
 `Error::InvalidRequest` before anything is sent (case 7); destructive tag/
@@ -1082,8 +1164,9 @@ is `TagApprover::clear`, not an empty string; every action is
 Two operations are **withheld** rather than made uncompilable, because the
 misuse is the server's behaviour and not a spelling: `TagsUpdate`'s
 `merge_*` constructors (open question 9) and `ExportFormat::Pdf` (open
-question 4). Both ship absent; adding either back once a live probe settles
-it is additive, not a breaking change.
+question 4). The first is now settled — merge is destructive, so it stays
+absent for good, and case 20 pins that. The second still ships absent pending
+a probe; adding it back is additive, not a breaking change.
 
 ## Naming divergences from the wire
 
@@ -1142,6 +1225,62 @@ it is additive, not a breaking change.
   *other* reqwest types in the public API, which `TryInto` would not touch.
   `Url::parse` at the call site stays one line.
 
+## Verification status
+
+Confidence in this wire layer is **not uniform**, and reading it as if it were
+is what let five defects ship at once. Every response shape below carries how
+it is known:
+
+- **observed** — a real body from a live account, recorded through
+  `ClientBuilder::observe` and replayed in `tests/replay.rs`;
+- **doc example** — Expensify's documentation shows a worked example of *this
+  job's* response;
+- **inferred** — no job-specific example; the shape is generalized from
+  another job or from a parameter table.
+
+| Response shape | Status | Notes |
+|---|---|---|
+| Policy List Getter → `policyList` | observed | correct as modelled; undocumented plans (`free`, `control`, `personalPolicy`) is why `PolicyPlan` is open |
+| Policy Getter, all five sections | observed | correct, both tag shapes included |
+| Downloader → raw file body | observed | correct |
+| Policy Creator → `policyID`/`policyName` | observed | correct; answered as `application/json` |
+| Expense Creator → `transactionList` | observed | envelope and fields as modelled, plus `reportID` (now surfaced — see below) and four echo fields (`comment`, `tag`, `mcc`, `category`) that are ignored |
+| Expense Creator auto-creates a report | observed | **undocumented.** An expense that named no report comes back with a `reportID` Expensify opened for it. Surfaced as `Option` anyway — one observation, and a decode failure here would report a created expense as an error |
+| Policy Updater (tags, replace) | observed | correct |
+| Expense Rules Creator → `{"responseMessage":"OK","responseCode":200}` | observed | `()` is right — no rule ID exists to return |
+| **Report Exporter submit → bare filename** | observed | **was wrong**: parsed as an envelope, so the flagship operation never worked |
+| **Reimburse, all skipped → 200** | observed | **was wrong**: 207-only strictness reported it as success |
+| **Reimburse, mixed → 200** | observed | same; `Ok` was short and looked complete |
+| **Expense Creator without `employeeEmail` → 410** | observed | **was wrong**: documented as optional, defaulting to the credential owner |
+| **Policy Updater tags, `action: "merge"` → 200** | observed | **was wrong** in the docs, not here: merge deletes unlisted tags. Withheld already, now on evidence |
+| Report Status Updater, non-`REIMBURSED` → 410 | observed | `Status '…' is not supported` for SUBMITTED/APPROVED/CLOSED — confirms misuse 9 |
+| Undocumented `responseCode: 666` | observed | `Rule already exists with those actions, please update rule N`; maps to `ApiErrorKind::Other` |
+| Reconciliation submit → `filename` envelope | doc example | **needs a domain-admin credential; unconfirmed.** Now known to differ from the exporter in at least this respect, so it is no longer safe to assume they match |
+| Report Creator → `reportID`/`reportName` | doc example | the response; the *permission* claim around it is separately unconfirmed (see below) |
+| Domain Cards Getter → `domainCardList` | doc example | blank-vs-null handling is inferred from the field descriptions |
+| Advanced Employee Updater → diff/skipped | doc example | |
+| Deprecated CSV updater → `nbEmployees` | doc example | |
+| Policy Updater categories/report fields (merge + replace) | doc example | only the tags path was probed |
+| Tag Approvers Updater → no body | doc example | |
+| Error envelope: body `responseCode` beats HTTP 200 | observed | repeatedly, across jobs |
+| 429 / `Retry-After` handling | inferred | never provoked |
+| Exporter `test: "true"` as a string | inferred | open question 7, and the highest-consequence guess left |
+| PDF export response | inferred | withheld entirely; open question 4 |
+| "Not yet rendered" download response | inferred | open question 1 |
+| Report-field key normalization | inferred | open question 12 |
+
+**The pattern is worth stating.** Every wrong claim came from inferring
+behaviour the docs did not demonstrate *for that specific job* — the exporter
+borrowed reconciliation's envelope, the expense creator borrowed a
+"defaults to the caller" convention, strictness borrowed 207 from a
+cross-cutting code table. Every shape that had a job-specific worked example
+was correct. Prose about a job is not evidence about that job; a worked
+example is. Two permission claims are also unconfirmed rather than wrong:
+`create report` needing a support unlock, and `employeeEmail` needing advanced
+permissions — both worked on a policy-admin trial account with neither. One
+account cannot prove a requirement never applies, so both stay documented as
+unconfirmed.
+
 ## Open questions
 
 1. **Downloading a not-yet-rendered export.** Report exports are async
@@ -1161,10 +1300,15 @@ it is additive, not a breaking change.
 2. **429 auto-retry.** Currently surfaced as `Error::RateLimited` with
    no retry. A `ClientBuilder::retry_rate_limited(max: u32)` knob is a
    natural v1.1 addition — rule on whether it belongs in v1.
-3. **Expense-rule responses.** Undocumented; if the creator actually
-   returns a `ruleID`, `CreateExpenseRuleAction::Output` should become
-   `RuleId` (otherwise users can never call `update_expense_rule`).
-   Probe with live credentials.
+3. ~~**Expense-rule responses.**~~ **Answered.** The creator returns
+   `{"responseMessage":"OK","responseCode":200}` and nothing else, so `()` is
+   the right output and there is no `ruleID` to hand back. The only observed
+   way to learn a rule's integer ID is an accident: re-creating an identical
+   rule answers the **undocumented `responseCode: 666`**, `Rule already exists
+   with those actions, please update rule N`. That is a `ApiErrorKind::Other`
+   here, with the message intact. Not worth a typed accessor — it would be an
+   API built on a collision — but worth knowing before creating rules you
+   intend to edit.
 4. **PDF exports** (`fileExtension: "pdf"`, one file *per report*): the
    interaction with `returnRandomFileName` (one name vs many) is
    undocumented, and one `ExportedFile` cannot name several files.
@@ -1199,24 +1343,24 @@ it is additive, not a breaking change.
 8. **`reportFields.data.values` object key.** The parameter table says
    `value`; the worked example says `name`. The implementation follows
    the example. The docs contradict themselves; probe.
-9. **Whether `action` is honoured for tag updates.** The inline-tags
-   table documents no `action` key and the prose says a tags update
-   "replaces the existing tags of the policy". If `action: "merge"` is
-   ignored, a `TagsUpdate::merge_*` would be destructive — the exact
-   failure the `replace_all_*` naming exists to prevent.
-
-   **Decided in the meantime:** `TagsUpdate` ships replace-only. A method
-   named `merge` that may delete every unlisted tag fails this crate's bar
-   however loud its doc comment is, and `replace_all_inline` /
-   `replace_all_csv` are honest under either server behaviour. Merge
-   returns if a live account confirms `action` is read.
-10. **Whether a partial reimbursement is always a 207.** The docs say
-    non-Approved reports "will be ignored", without saying under which
-    code. If a run can ignore reports under a plain 200, the strict
-    path's `Ok(Vec<ReportId>)` can be shorter than the request and still
-    look like full success — reopening misuse 8 from the server side.
-    Documented on `ReimburseAction`; not fixable without evidence.
-11. **Report-field key normalization case.** Expensify's rule text
+9. ~~**Whether `action` is honoured for tag updates.**~~ **Answered, and the
+   worst way.** Tags were set to Alpha + Beta, then Gamma alone was sent with
+   `action: "merge"`. Alpha and Beta were **deleted**; the response was
+   `{"responseCode":200}` with no warning. So `action` is read, and "merge"
+   means replace. `TagsUpdate` stays replace-only permanently — a `merge_*`
+   constructor would be a `replace_all_*` under a name promising the
+   opposite — and misuse 20 pins it.
+10. ~~**Whether a partial reimbursement is always a 207.**~~ **Answered: it
+    is never a 207, so far.** Both probed shapes came back 200 — all-skipped,
+    and mixed (one Approved, two Open). The strict path now keys on the
+    skipped/failed lists, which is correct under either code; see
+    [§ Reimbursement](#reimbursement-strict-vs-tolerant-partial-success).
+    What is still unknown is whether 207 ever appears at all; the branch is
+    kept for it.
+11. **Whether only `REIMBURSED` is accepted — answered, yes.** `SUBMITTED`,
+    `APPROVED` and `CLOSED` each return 410, `Status '…' is not supported`.
+    Misuse 9 (no status parameter exists) is confirmed rather than assumed.
+12. **Report-field key normalization case.** Expensify's rule text
     matches this implementation (non-alphanumeric → `_`, case
     preserved), but its worked example's keys are all lowercase.
     Probably nothing; confirm before adding a `to_lowercase`.

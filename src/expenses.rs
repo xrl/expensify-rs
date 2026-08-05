@@ -125,39 +125,54 @@ impl Expense {
 }
 
 /// Expense Creator (`type: "create"`, `inputSettings.type: "expenses"`).
+///
+/// The employee the expenses belong to is a required argument of
+/// [`Client::create_expenses`](crate::Client::create_expenses), not a setter:
+/// Expensify rejects the job without it (410, `'employeeEmail' parameter is
+/// missing or malformed`), with or without a policy on the expenses.
 #[must_use = "actions do nothing until awaited"]
 pub struct CreateExpensesAction {
     pub(crate) client: Client,
     pub(crate) expenses: Vec<Expense>,
-    pub(crate) employee_email: Option<String>,
+    pub(crate) employee_email: String,
 }
 
 impl CreateExpensesAction {
-    pub(crate) fn new(client: Client, expenses: Vec<Expense>) -> Self {
+    pub(crate) fn new(client: Client, employee_email: String, expenses: Vec<Expense>) -> Self {
         Self {
             client,
             expenses,
-            employee_email: None,
+            employee_email,
         }
-    }
-
-    /// Create in another user's account. Default: the credential owner's
-    /// account.
-    ///
-    /// Restricted: Expensify must grant the credential advanced
-    /// permissions, otherwise the job fails with
-    /// [`ApiErrorKind::InvalidPermissions`](crate::ApiErrorKind::InvalidPermissions).
-    pub fn employee_email(mut self, email: impl Into<String>) -> Self {
-        self.employee_email = Some(email.into());
-        self
     }
 }
 
 /// One created expense, as echoed back by Expensify.
+///
+/// The response also carries `comment`, `tag`, `category` and `mcc`, which
+/// echo the request (or Expensify's defaults for it, e.g. `"Uncategorized"`)
+/// rather than telling the caller anything new. They are not modelled; the
+/// raw body is one `ClientBuilder::observe` away if you need them.
 #[derive(Clone, Debug)]
 pub struct CreatedTransaction {
     /// Assigned identifier.
     pub transaction_id: TransactionId,
+    /// The report the expense landed in.
+    ///
+    /// **Undocumented, and the reason this field exists:** an expense created
+    /// without [`Expense::report_id`] is not left loose. Expensify opens a
+    /// report for it and names that report here, so this is the only way to
+    /// learn where the expense went short of a separate export.
+    ///
+    /// **`Option` deliberately — do not tidy this away.** `reportID` has been
+    /// present on every observed response, so the type looks needlessly weak.
+    /// It is not: this field describes a side effect rather than the
+    /// transaction, and making it required would turn a response that omitted
+    /// it into a decode error on an expense that *was created*. An error that
+    /// does not mean "nothing happened" is the worst failure this API can
+    /// hand a caller — retrying duplicates the expense, and not retrying
+    /// leaves one they cannot find. `None` costs them only this knowledge.
+    pub report_id: Option<ReportId>,
     /// Merchant as stored.
     pub merchant: String,
     /// Expense date (`created` on the wire).

@@ -1,0 +1,16 @@
+error[E0599]: no associated function or constant named `merge_inline` found for struct `TagsUpdate` in the current scope
+ --> tests/ui/20_tag_merge_withheld.rs:8:25
+  |
+8 |     let _ = TagsUpdate::merge_inline([TagLevel::new([PolicyTag::new("Gamma")])]);
+  |                         ^^^^^^^^^^^^ associated function or constant not found in `TagsUpdate`
+  |
+note: if you're trying to build a new `TagsUpdate` consider using one of the following associated functions:
+      TagsUpdate::replace_all_inline
+      TagsUpdate::replace_all_csv
+ --> src/policy/update.rs
+  |
+  |     pub fn replace_all_inline<I: IntoIterator<Item = TagLevel>>(levels: I) -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+  |     pub fn replace_all_csv(data: impl Into<Bytes>, config: TagCsvConfig) -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

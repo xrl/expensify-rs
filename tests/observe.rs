@@ -1,11 +1,12 @@
 //! Observability: what an observer sees, when, and what it is for.
 //!
-//! The motivating case has its own test
-//! ([`a_plain_text_response_is_diagnosable_without_curl`]): an export that
-//! answers a bare filename as `text/plain` instead of the JSON envelope this
-//! crate expects, which surfaces to a caller as
-//! `decode error: expected value at line 1 column 1` and says nothing about
-//! why.
+//! The motivating case was an export that answered a bare filename as
+//! `text/plain` instead of the JSON envelope this crate expected, and surfaced
+//! to the caller as `decode error: expected value at line 1 column 1` — not one
+//! word about what column 1 held. The exchange is what held the answer, and the
+//! answer is what fixed the exporter (`tests/replay.rs`). What generalizes is
+//! [`an_unreadable_response_is_diagnosable_without_curl`]: whatever this crate
+//! cannot parse next, the exchange still says what arrived.
 
 use std::sync::{Arc, Mutex};
 
@@ -34,19 +35,18 @@ fn client(server: &MockServer, recorder: &Recorder) -> Client {
         .build()
 }
 
-/// The incident this feature exists for, reproduced.
+/// The incident this feature exists for, in the form it survives in.
 ///
-/// Expensify's Report Exporter answers the generated filename as bare
-/// `text/plain`, not as the documented JSON envelope. The library's error says
-/// only that column 1 was not JSON; the exchange says what column 1 actually
-/// was. (Making the export *succeed* against this response is a separate fix;
-/// what is asserted here is that the mismatch is legible without curl.)
+/// A bare `text/plain` filename is now the exporter's *understood* success
+/// shape (`tests/replay.rs`). What remains undiagnosable from the error alone
+/// is a body that is neither that nor an envelope — here an intermediary's
+/// HTML under a 200. The error names the class; the exchange names the body.
 #[tokio::test]
-async fn a_plain_text_response_is_diagnosable_without_curl() {
+async fn an_unreadable_response_is_diagnosable_without_curl() {
     let server = server_with(
         ResponseTemplate::new(200)
-            .insert_header("content-type", "text/plain")
-            .set_body_string("exportfilename_1754336489.csv"),
+            .set_body_bytes(b"<html>\n<body>upstream timeout</body>\n</html>".to_vec())
+            .insert_header("content-type", "text/html"),
     )
     .await;
 
@@ -55,30 +55,27 @@ async fn a_plain_text_response_is_diagnosable_without_curl() {
     let err = client(&server, &recorder)
         .export_reports(&template, ReportsQuery::report_ids(["R006AseGxMka"]))
         .await
-        .expect_err("a bare filename is not an envelope");
+        .expect_err("an HTML page is not a filename");
 
-    // What the caller sees today, unchanged by this feature.
+    // What the caller sees: the class of failure, not the body.
     assert!(
         matches!(err, Error::Decode(_)),
         "expected a decode error, got {err:?}"
     );
-    // The sentence the incident was reported as: `error: decode error` /
-    // `caused by: json: expected value at line 1 column 1`, and not one word
-    // about what column 1 held.
     let chain = std::iter::successors(Some(&err as &dyn std::error::Error), |err| err.source())
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ");
     assert!(
-        chain.contains("expected value at line 1 column 1"),
+        chain.contains("neither an envelope nor a filename"),
         "{chain}"
     );
 
     // What the observer adds: the three facts that identify the mismatch.
     let exchange = recorder.take().pop().expect("one exchange");
     assert_eq!(exchange.status(), 200);
-    assert_eq!(exchange.content_type(), Some("text/plain"));
-    assert_eq!(exchange.body_text(), "exportfilename_1754336489.csv");
+    assert_eq!(exchange.content_type(), Some("text/html"));
+    assert!(exchange.body_text().contains("upstream timeout"));
 
     // ... and the request that provoked it, so the job type and filters are
     // not a second question.
@@ -91,11 +88,7 @@ async fn a_plain_text_response_is_diagnosable_without_curl() {
 
     // One rendering carries all of it, which is what the CLI prints.
     let rendered = exchange.to_string();
-    for expected in [
-        "text/plain",
-        "exportfilename_1754336489.csv",
-        "R006AseGxMka",
-    ] {
+    for expected in ["text/html", "upstream timeout", "R006AseGxMka"] {
         assert!(rendered.contains(expected), "{rendered}");
     }
 }

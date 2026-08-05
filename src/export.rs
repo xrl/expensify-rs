@@ -244,6 +244,9 @@ impl From<EmailOnFinish> for OnFinish {
 /// `onReceive.immediateResponse: ["returnRandomFileName"]` and resolves to
 /// the generated file handle; the export itself completes asynchronously
 /// server-side.
+///
+/// Submitting answers the filename as a bare `text/plain` body rather than
+/// the JSON envelope every other job uses — see `wire::parse_filename`.
 #[must_use = "actions do nothing until awaited"]
 pub struct ExportReportsAction<F> {
     pub(crate) client: Client,
@@ -351,8 +354,9 @@ impl<F: 'static> IntoFuture for ExportReportsAction<F> {
                 ));
             }
             let request = wire::export_reports(&self);
-            let response = self.client.send(request).await?;
-            let name = wire::filename(response)?;
+            // Not `send`: the exporter answers a bare filename, not an
+            // envelope. See `wire::parse_filename`.
+            let name = self.client.send_filename(request).await?;
             // The producer pins the file system; download never asks.
             Ok(ExportedFile::from_response(
                 name,

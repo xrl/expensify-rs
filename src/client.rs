@@ -227,10 +227,11 @@ impl Client {
 
     /// Report Creator.
     ///
-    /// Restricted: Expensify support must enable report creation for your
-    /// domain, and the credentials need both domain-admin and policy-admin
-    /// rights. Without that the job fails with "Not authorized to
-    /// authenticate as user" as an [`Error::Api`](crate::Error::Api).
+    /// Expensify documents this as needing an unlock from support plus
+    /// domain-admin rights; it worked on a policy-admin trial account with
+    /// neither, so treat the requirement as unconfirmed rather than absent.
+    /// If it does apply the job fails with "Not authorized to authenticate as
+    /// user" as an [`Error::Api`](crate::Error::Api).
     pub fn create_report<I>(
         &self,
         policy_id: impl Into<PolicyId>,
@@ -250,13 +251,27 @@ impl Client {
         )
     }
 
-    /// Expense Creator. Expenses land in the credential owner's account
-    /// unless [`CreateExpensesAction::employee_email`] says otherwise.
-    pub fn create_expenses<I>(&self, expenses: I) -> CreateExpensesAction
+    /// Expense Creator.
+    ///
+    /// `employee_email` is required — Expensify answers 410,
+    /// `'employeeEmail' parameter is missing or malformed`, without it, and
+    /// does so whether or not the expenses name a policy. It does *not*
+    /// default to the credential owner. Naming another user is documented as
+    /// needing advanced permissions, but a plain policy-admin trial account
+    /// creates expenses for its own address without any grant.
+    pub fn create_expenses<I>(
+        &self,
+        employee_email: impl Into<String>,
+        expenses: I,
+    ) -> CreateExpensesAction
     where
         I: IntoIterator<Item = Expense>,
     {
-        CreateExpensesAction::new(self.clone(), expenses.into_iter().collect())
+        CreateExpensesAction::new(
+            self.clone(),
+            employee_email.into(),
+            expenses.into_iter().collect(),
+        )
     }
 
     /// The only report-status transition Expensify supports: Approved →

@@ -113,24 +113,28 @@ including any personal data the response carries.
 
 ## Status
 
-Working and tested, but **the wire format has not been verified against a live
-Expensify account.** Expensify publishes no OpenAPI spec, no schema, and no
-changelog, so every field name and value type here is derived from their prose
-documentation. The test suite pins this crate's reading of those docs — it
-cannot tell you the reading is right.
+**Partly verified against a live account, mostly not.** Expensify publishes no
+OpenAPI spec, no schema, and no changelog, so most field names and value types
+here are derived from their prose documentation, and the test suite pins this
+crate's *reading* of those docs rather than the docs' correctness. A dozen
+response shapes have now been recorded off a real account and are replayed as
+fixtures; five documented claims turned out to be wrong, including the export
+submit response, which meant `export_reports` never worked before 0.3.0.
 
-Where a guess carries real consequences, the affected method says so in its own
-rustdoc rather than burying it here. The current list is tracked in
-[`docs/DESIGN.md` § Open questions](docs/DESIGN.md#open-questions); the ones
-worth knowing before you reach for them:
+[`docs/DESIGN.md` § Verification status](docs/DESIGN.md#verification-status)
+lists every response shape as observed, doc example, or inference — read it
+before trusting anything not marked observed. Where a guess carries real
+consequences the affected method says so in its own rustdoc; the ones worth
+knowing before you reach for them:
 
 - `ExportReportsAction::test_run` — the flag's encoding is inferred. If it is
   wrong, the dry run is not dry and `on_finish` actions fire.
-- `ReimburseAction` — Expensify may report a partially-applied reimbursement as
-  a plain success, in which case the strict path cannot detect it.
+- `DomainClient::reconcile` — its response shape is a doc example, and the
+  exporter's turned out not to match its own. Confirming it needs a
+  domain-admin credential.
 - Some operations are deliberately withheld rather than shipped half-known.
-  Merging (rather than replacing) policy tags is one; PDF export is another.
-  Both are additive to restore once confirmed.
+  PDF export is one. Merging (rather than replacing) policy tags is not coming
+  back: `action: "merge"` was observed deleting every unlisted tag.
 
 If you have a partner credential pair, `cargo run --example tour` reads
 `EXPENSIFY_PARTNER_USER_ID` and `EXPENSIFY_PARTNER_USER_SECRET` from the

@@ -488,6 +488,13 @@ impl Client {
         parse_download(status, &headers, body)
     }
 
+    /// Submit a job whose success body is a bare filename rather than an
+    /// envelope. See [`parse_filename`].
+    pub(crate) async fn send_filename(&self, request: JobRequest) -> Result<String, Error> {
+        let (status, headers, body) = self.raw(request).await?;
+        parse_filename(status, &headers, &body)
+    }
+
     async fn raw(&self, request: JobRequest) -> Result<(StatusCode, HeaderMap, Bytes), Error> {
         if let Some(gate) = &self.inner.limiter {
             gate.acquire().await;
@@ -689,6 +696,71 @@ fn parse_download(status: StatusCode, headers: &HeaderMap, body: Bytes) -> Resul
     Ok(body)
 }
 
+/// A submitted Report Exporter answers the generated filename as a **bare
+/// body**, not as a JSON envelope:
+///
+/// ```text
+/// HTTP 200, content-type: text/plain;charset=utf-8
+/// export0fd99e06-a636-4974-b6bc-3ceb12163386.csv
+/// ```
+///
+/// Observed live 2026-08-04, and the reason `export reports` never worked:
+/// the `{"responseCode":200,"filename":…}` shape in Expensify's docs is
+/// reconciliation's, and was generalized to the exporter on the assumption
+/// that one envelope covers every job.
+///
+/// **Discrimination is by shape, not by content type.** The same endpoint
+/// answers JSON as `text/plain;charset=utf-8` (expense rules, reimburse) and
+/// as `application/json` (policy creator), so the header says nothing about
+/// the body. What is keyed on instead is the job: only the exporter takes
+/// this path, and within it a JSON object is an envelope (an error, or the
+/// documented shape if Expensify ever starts sending it) while anything else
+/// is the filename itself.
+///
+/// The bare form is accepted only if it looks like a filename — non-empty and
+/// free of control characters. A body that is neither an envelope nor a
+/// plausible name (an HTML error page from a proxy, say) is a decode error
+/// rather than a handle that would fail later, from `download`, for reasons
+/// that no longer mention the export.
+fn parse_filename(status: StatusCode, headers: &HeaderMap, body: &Bytes) -> Result<String, Error> {
+    if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body) {
+        match response_code(&map) {
+            Some(200) => return filename(Value::Object(map)),
+            Some(code) => return Err(api_error(code, &map, headers)),
+            None if map.contains_key("responseMessage") => {
+                return Err(DecodeError::custom(format!(
+                    "export returned an error envelope: {}",
+                    response_message(&map).unwrap_or_default()
+                ))
+                .into());
+            }
+            None => {}
+        }
+    }
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::RateLimited {
+            retry_after: retry_after(headers),
+        });
+    }
+    if !status.is_success() {
+        return Err(Error::Http {
+            status,
+            body: String::from_utf8_lossy(body).into_owned(),
+        });
+    }
+
+    let name = String::from_utf8_lossy(body).trim().to_owned();
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err(DecodeError::custom(format!(
+            "export response is neither an envelope nor a filename: `{}`",
+            String::from_utf8_lossy(body).escape_debug()
+        ))
+        .into());
+    }
+    Ok(name)
+}
+
 fn decode<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|err| DecodeError::Json(err).into())
 }
@@ -705,8 +777,9 @@ fn take_required(value: &mut Value, field: &str) -> Result<Value, Error> {
     take(value, field).ok_or_else(|| missing(field))
 }
 
-/// Both the exporter and reconciliation answer with the generated filename;
-/// the documented key is `filename`, but tolerate the camelCase spelling.
+/// The generated filename out of an envelope. Reconciliation's documented
+/// shape, and the exporter's fallback if it ever answers one; the documented
+/// key is `filename`, but tolerate the camelCase spelling.
 pub(crate) fn filename(mut value: Value) -> Result<String, Error> {
     let raw = take(&mut value, "filename")
         .or_else(|| take(&mut value, "fileName"))
@@ -1138,7 +1211,9 @@ fn transaction(expense: &Expense) -> Value {
 pub(crate) fn create_expenses(action: &CreateExpensesAction) -> JobRequest {
     let mut input = Map::new();
     input.insert("type".to_owned(), json!("expenses"));
-    opt!(input, "employeeEmail", action.employee_email);
+    // Required, with or without a policy: omitting it is a 410, `'employeeEmail'
+    // parameter is missing or malformed` (observed live 2026-08-04).
+    input.insert("employeeEmail".to_owned(), json!(action.employee_email));
     input.insert(
         "transactionList".to_owned(),
         Value::Array(action.expenses.iter().map(transaction).collect()),
@@ -1152,10 +1227,18 @@ struct TransactionListResponse {
     transactions: Vec<TransactionWire>,
 }
 
+/// No `deny_unknown_fields`, deliberately: the observed body also carries
+/// `comment`, `tag`, `category` and `mcc`, and a response growing a field must
+/// not fail a created expense.
 #[derive(Deserialize)]
 struct TransactionWire {
     #[serde(rename = "transactionID")]
     transaction_id: TransactionId,
+    /// Present in every observed response — Expensify auto-creates a report
+    /// when the expense named none — and optional anyway. The expense exists
+    /// by the time this is decoded, so a missing key must not fail the call.
+    #[serde(rename = "reportID", default)]
+    report_id: Option<ReportId>,
     merchant: String,
     created: String,
     amount: i64,
@@ -1169,6 +1252,7 @@ pub(crate) fn created_transactions(value: Value) -> Result<Vec<CreatedTransactio
         .map(|wire| {
             Ok(CreatedTransaction {
                 transaction_id: wire.transaction_id,
+                report_id: wire.report_id,
                 merchant: wire.merchant,
                 created: parse_date(&wire.created).ok_or_else(|| {
                     Error::from(DecodeError::custom(format!(
@@ -1243,8 +1327,9 @@ pub(crate) fn reimburse_outcome(value: Value) -> Result<ReimburseOutcome, Error>
     })
 }
 
-/// 207 is the documented partial-success code; it is what splits the strict
-/// and tolerant reimbursement paths.
+/// 207 is the documented partial-success code. It is *a* signal, not the
+/// signal: a run that skipped every report came back 200, so the strict path
+/// also checks the skipped/failed lists. See [`crate::ReimburseAction`].
 pub(crate) fn is_partial(value: &Value) -> bool {
     value
         .as_object()
@@ -1648,6 +1733,74 @@ mod tests {
         }
     }
 
+    /// The exporter's observed success shape. `text/plain` is deliberately
+    /// *not* what says so — this endpoint sends JSON under that same header
+    /// for other jobs — so the header is absent here and parsing works anyway.
+    #[test]
+    fn a_bare_body_is_the_exported_filename() {
+        let body = Bytes::from_static(b"export0fd99e06-a636-4974-b6bc-3ceb12163386.csv");
+        let name = parse_filename(StatusCode::OK, &HeaderMap::new(), &body).unwrap();
+        assert_eq!(name, "export0fd99e06-a636-4974-b6bc-3ceb12163386.csv");
+    }
+
+    #[test]
+    fn an_envelope_is_still_an_envelope_for_the_exporter() {
+        let body = Bytes::from_static(br#"{"responseCode":200,"filename":"export_1.csv"}"#);
+        assert_eq!(
+            parse_filename(StatusCode::OK, &HeaderMap::new(), &body).unwrap(),
+            "export_1.csv"
+        );
+
+        let failure =
+            parse_filename(StatusCode::OK, &HeaderMap::new(), &envelope(410)).unwrap_err();
+        match failure {
+            Error::Api(api) => assert_eq!(api.code, 410),
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    /// A filename is one line of text. Anything else — an empty body, a proxy's
+    /// HTML — is a decode error rather than a handle whose download fails later
+    /// for reasons that never mention the export.
+    #[test]
+    fn a_body_that_is_not_a_filename_is_rejected() {
+        for body in [
+            Bytes::new(),
+            Bytes::from_static(b"   \n"),
+            Bytes::from_static(b"<html>\n<body>502</body>\n</html>"),
+        ] {
+            match parse_filename(StatusCode::OK, &HeaderMap::new(), &body) {
+                Err(Error::Decode(DecodeError::Custom(msg))) => {
+                    assert!(msg.contains("neither an envelope nor a filename"), "{msg}");
+                }
+                other => panic!("expected a decode error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Live evidence: tags sent with `action: "merge"` deleted every unlisted
+    /// tag and answered 200. Whatever `TagsUpdate` grows, `merge` must not
+    /// reach the wire for tags.
+    #[test]
+    fn tag_updates_never_send_merge() {
+        let client = crate::Client::new(crate::Credentials::new("id", "secret"));
+        let inline = client
+            .update_policy("P1")
+            .tags(TagsUpdate::replace_all_inline([TagLevel::new([
+                PolicyTag::new("Gamma"),
+            ])]));
+        let csv = client.update_policy("P1").tags(TagsUpdate::replace_all_csv(
+            Bytes::from_static(b"Gamma\n"),
+            TagCsvConfig::dependent(false),
+        ));
+        for action in [inline, csv] {
+            assert_eq!(
+                update_policy(&action).description()["tags"]["action"],
+                "replace"
+            );
+        }
+    }
+
     #[test]
     fn float_response_codes_are_still_codes() {
         let body = Bytes::from_static(br#"{"responseCode":410.0,"responseMessage":"nope"}"#);
@@ -1822,15 +1975,20 @@ mod tests {
     #[test]
     fn expense_uses_integer_cents_and_created() {
         let client = crate::Client::new(crate::Credentials::new("id", "secret"));
-        let action = client.create_expenses([Expense::new(
-            "Cloud Inc",
-            date!(2026 - 07 - 31),
-            Money::new(129_00, "USD"),
-        )
-        .category("Infrastructure")
-        .external_id("hosting-2026-07")
-        .tax(ExpenseTax::new("id_TAX_OPTION_16").amount_cents(600))]);
+        let action = client.create_expenses(
+            "ap@acme.com",
+            [Expense::new(
+                "Cloud Inc",
+                date!(2026 - 07 - 31),
+                Money::new(129_00, "USD"),
+            )
+            .category("Infrastructure")
+            .external_id("hosting-2026-07")
+            .tax(ExpenseTax::new("id_TAX_OPTION_16").amount_cents(600))],
+        );
         let request = create_expenses(&action);
+        // Required by Expensify, so it is never absent.
+        assert_eq!(request.input()["employeeEmail"], "ap@acme.com");
         let txn = &request.input()["transactionList"][0];
         assert_eq!(txn["amount"], json!(12900));
         assert_eq!(txn["currency"], "USD");
