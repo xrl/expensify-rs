@@ -28,6 +28,10 @@ signatures change shape (below). Everything else here is additive.
 - CLI: `expensify skill install` writes the Claude Code agent skill embedded in
   the binary (`cli/skill/SKILL.md`) into a personal or repository-local skills
   directory. The library is unchanged.
+- Skill: a section on diagnosing a failed command — which commands are safe to
+  re-run under `-vv` and which have already had their server-side effect, and
+  how to file the defect without republishing a credential or an employee's
+  data. The library is unchanged.
 
 ## 0.2.0 — 2026-08-04
 
