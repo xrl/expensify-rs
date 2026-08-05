@@ -147,10 +147,13 @@ fn declared_extension<F: FromExport>(file_system: FileSystem) -> &'static str {
 }
 
 /// A decode failure on a file whose extension disagrees with the marker is
-/// almost always an overridden `.format`, not a broken template. Say so —
-/// the bare serde error ("expected value at line 1 column 1") reads as an
-/// accusation against the FreeMarker source, which is the wrong place to
-/// look. Every other case passes through untouched.
+/// usually an overridden `.format`, not a broken template — but the bare
+/// serde error ("expected value at line 1 column 1") reads as an accusation
+/// against the FreeMarker source, which is the wrong place to look. So the
+/// real error leads and the mismatch follows as the observation it is: a
+/// handle can also arrive by serde from an export this crate never made, and
+/// a `String` marker can fail on non-UTF-8 bytes for reasons of its own.
+/// A decode error whose extension matches passes through untouched.
 fn blame_the_format<F: FromExport>(name: &str, file_system: FileSystem, err: DecodeError) -> Error {
     let declared = declared_extension::<F>(file_system);
     let Some(actual) = name.rsplit_once('.').map(|(_, ext)| ext) else {
@@ -160,9 +163,9 @@ fn blame_the_format<F: FromExport>(name: &str, file_system: FileSystem, err: Dec
         return err.into();
     }
     DecodeError::custom(format!(
-        "`{name}` is a `{actual}` file but this handle's template marker decodes `{declared}`; \
-         the export ran with an explicit `.format` that overrode the marker. Match them, or \
-         download the handle's `untyped()` form for raw bytes. Underlying error: {err}"
+        "decoding `{name}` failed: {err}. Its extension is `{actual}`, but this handle's \
+         template marker decodes `{declared}` — usually an explicit `.format` on the export \
+         that overrode the marker. Match them, or download `untyped()` for raw bytes"
     ))
     .into()
 }
