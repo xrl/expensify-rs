@@ -43,12 +43,15 @@ Also observed: the expense-rules creator returns no rule ID (so `()` is
 right), the undocumented `responseCode: 666` is the only way to learn a rule's
 ID, and `REIMBURSED` really is the only accepted report status.
 
-- **`CreatedTransaction::report_id`** — new field, recording an undocumented
-  side effect: an expense created without `Expense::report_id` is not left
-  loose. Expensify opens a report for it and names it in the response, which
-  this crate was discarding, so a caller could not find their own expense
-  without a separate export. The CLI prints it as a `REPORT ID` column and a
-  `report_id` key. Technically breaking for anyone destructuring or
+- **`CreatedTransaction::report_id: Option<ReportId>`** — new field, recording
+  an undocumented side effect: an expense created without `Expense::report_id`
+  is not left loose. Expensify opens a report for it and names it in the
+  response, which this crate was discarding, so a caller could not find their
+  own expense without a separate export. The CLI prints it as a `REPORT ID`
+  column and a `report_id` key. `Option` even though every observed response
+  carries it: the expense exists by the time the response is decoded, so a
+  missing key must not turn a created expense into an error nobody can act on
+  or safely retry. Technically breaking for anyone destructuring or
   struct-literal-constructing `CreatedTransaction`, which 0.3.0 already is.
 
 ### Everything else

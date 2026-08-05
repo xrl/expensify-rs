@@ -80,7 +80,11 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
             .map(|transaction| {
                 vec![
                     transaction.transaction_id.to_string(),
-                    transaction.report_id.to_string(),
+                    transaction
+                        .report_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                     transaction.merchant.clone(),
                     transaction.created.to_string(),
                     transaction.amount_cents.to_string(),

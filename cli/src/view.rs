@@ -8,7 +8,7 @@
 use expensify::{
     Category, CreatedPolicy, CreatedReport, CreatedTransaction, DomainCard, EmployeeUpdateOutcome,
     PolicyEmployee, PolicyRole, PolicySummary, PolicyTag, PolicyTags, ReimburseOutcome,
-    ReportField, ReportFieldType, SkippedReport, TaxConfig,
+    ReportField, ReportFieldType, ReportId, SkippedReport, TaxConfig,
 };
 use serde_json::{Value, json};
 
@@ -157,8 +157,9 @@ pub fn created_report(report: &CreatedReport) -> Value {
 pub fn created_transaction(transaction: &CreatedTransaction) -> Value {
     json!({
         "transaction_id": transaction.transaction_id.as_str(),
-        // Expensify opens a report for an expense that named none.
-        "report_id": transaction.report_id.as_str(),
+        // Expensify opens a report for an expense that named none. Null only
+        // if a response ever omits it; none has.
+        "report_id": transaction.report_id.as_ref().map(ReportId::as_str),
         "merchant": transaction.merchant,
         "date": transaction.created.to_string(),
         "amount_cents": transaction.amount_cents,

@@ -1234,12 +1234,11 @@ struct TransactionListResponse {
 struct TransactionWire {
     #[serde(rename = "transactionID")]
     transaction_id: TransactionId,
-    /// Always present in the observed response — Expensify auto-creates a
-    /// report when the expense named none. Required rather than `Option`, on
-    /// the same grounds as every other field here: absence would mean the
-    /// shape moved, and answering `None` would hide that.
-    #[serde(rename = "reportID")]
-    report_id: ReportId,
+    /// Present in every observed response — Expensify auto-creates a report
+    /// when the expense named none — and optional anyway. The expense exists
+    /// by the time this is decoded, so a missing key must not fail the call.
+    #[serde(rename = "reportID", default)]
+    report_id: Option<ReportId>,
     merchant: String,
     created: String,
     amount: i64,

@@ -8,7 +8,7 @@
 
 use expensify::{
     Client, Credentials, Error, Expense, ExportTemplate, FileSystem, Money, ReimburseTargets,
-    ReportsQuery, Url,
+    ReportId, ReportsQuery, Url,
 };
 use serde_json::Value;
 use time::macros::date;
@@ -282,12 +282,44 @@ async fn a_created_expense_names_the_report_it_landed_in() {
         .await
         .expect("the recorded response is a success");
 
-    assert_eq!(created[0].report_id.as_str(), "R009WqAY45L1");
+    assert_eq!(
+        created[0].report_id.as_ref().map(ReportId::as_str),
+        Some("R009WqAY45L1")
+    );
 
     // Nothing in the request asked for a report; the server made one.
     let requests = server.received_requests().await.expect("recorded requests");
     let transaction = &job(&requests[0])["inputSettings"]["transactionList"][0];
     assert!(transaction.get("reportID").is_none(), "{transaction}");
+}
+
+/// The branch no recorded body can cover, and the reason `report_id` is an
+/// `Option`: by the time this decodes, the expense exists. A missing key must
+/// cost the caller the report's name and nothing else — never an error that
+/// leaves them unable to retry *or* to find what they created.
+#[tokio::test]
+async fn a_response_without_a_report_id_is_still_a_created_expense() {
+    let server = replaying(&Fixture {
+        body: br#"{"transactionList":[{"amount":777,"created":"2026-08-03","merchant":"Fixture Probe","currency":"USD","transactionID":"4056343049275634494"}],"responseCode":200}"#,
+        status: 200,
+        content_type: None,
+    })
+    .await;
+
+    let created = client(&server)
+        .create_expenses(
+            "user@example.com",
+            [Expense::new(
+                "Fixture Probe",
+                date!(2026 - 08 - 03),
+                Money::new(777, "USD"),
+            )],
+        )
+        .await
+        .expect("a missing reportID is not a failed expense");
+
+    assert_eq!(created[0].transaction_id.as_str(), "4056343049275634494");
+    assert!(created[0].report_id.is_none());
 }
 
 // ---------------------------------------------------------------------------

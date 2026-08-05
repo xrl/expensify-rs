@@ -163,7 +163,16 @@ pub struct CreatedTransaction {
     /// without [`Expense::report_id`] is not left loose. Expensify opens a
     /// report for it and names that report here, so this is the only way to
     /// learn where the expense went short of a separate export.
-    pub report_id: ReportId,
+    ///
+    /// **`Option` deliberately — do not tidy this away.** `reportID` has been
+    /// present on every observed response, so the type looks needlessly weak.
+    /// It is not: this field describes a side effect rather than the
+    /// transaction, and making it required would turn a response that omitted
+    /// it into a decode error on an expense that *was created*. An error that
+    /// does not mean "nothing happened" is the worst failure this API can
+    /// hand a caller — retrying duplicates the expense, and not retrying
+    /// leaves one they cannot find. `None` costs them only this knowledge.
+    pub report_id: Option<ReportId>,
     /// Merchant as stored.
     pub merchant: String,
     /// Expense date (`created` on the wire).

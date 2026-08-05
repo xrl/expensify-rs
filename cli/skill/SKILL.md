@@ -241,7 +241,10 @@ strictly `YYYY-MM-DD` — `07/01/2026` is a usage error.
   credential owner; without it Expensify answers 410.
 - `create expenses` without `--report-id` does not leave the expense loose:
   Expensify opens a report for it. The `report_id` column names that report,
-  and it is the only way to find the expense without a separate export.
+  and it is the only way to find the expense without a separate export. It has
+  been present on every observed response but is typed nullable on purpose —
+  if it is ever `null` the expense was still created, so treat a missing
+  report ID as "look it up", never as a failure to retry.
 - `reimburse` treats a partially applied run as an error (exit 8) — including
   the case Expensify reports as a plain `responseCode: 200` with every report
   skipped, which it does. Add `--tolerate-partial` to get the
