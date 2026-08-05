@@ -1,15 +1,18 @@
 ---
 name: expensify
 description: >
-  Drive the `expensify` CLI against the Expensify Integration Server API: partner
-  credentials, policies (categories, tags, report fields, tax rates, members),
-  company cards, FreeMarker report exports and card reconciliation, expense and
-  report creation, expense rules, the employee updater, and marking approved reports
-  reimbursed. Use when the user mentions Expensify, expense reports, a partner user
-  ID/secret, policy IDs, exporting or reconciling expense data, or reimbursing
-  reports. Carries what `--help` cannot: where credentials come from, which
-  operations need domain-admin rights or an unlock from Expensify support, which
-  are irreversible, and which wire behaviours are unverified guesses.
+  Drive and debug the `expensify` CLI against the Expensify Integration Server
+  API: partner credentials, policies (categories, tags, report fields, tax rates,
+  members), company cards, FreeMarker report exports and card reconciliation,
+  expense and report creation, expense rules, the employee updater, and marking
+  approved reports reimbursed. Use when the user mentions Expensify, expense
+  reports, a partner user ID/secret, policy IDs, exporting or reconciling expense
+  data, or reimbursing reports — and whenever an `expensify` command errors, exits
+  non-zero or answers something unexpected, because diagnosing it means knowing
+  which failures are safe to re-run under `-vv` and how to report the defect.
+  Carries what `--help` cannot: where credentials come from, which operations need
+  domain-admin rights or an unlock from Expensify support, which are irreversible,
+  and which wire behaviours are unverified guesses.
 ---
 
 # expensify CLI
@@ -233,15 +236,58 @@ strictly `YYYY-MM-DD` — `07/01/2026` is a usage error.
   automatically; `--no-rate-limit` opts out. The limiter is per-process, so
   several processes sharing one credential pair still need pacing of their own.
   A 429 is exit 7 with no auto-retry.
-- Exit 10 ("unreadable response") is the one to re-run with `-vv`: it prints
-  the request as sent, credentials redacted, and the raw response body with
-  its content-type, which is normally enough to see what Expensify actually
-  answered. Response bodies contain employee names and email addresses — do
-  not paste that output anywhere without reading it first.
+- Exit 10 ("unreadable response") is the one `-vv` was built for — see *When a
+  command fails*, which also covers when re-running it is safe.
 - Useful exit codes for branching: `2` usage, `3` no credentials, `4`
   permission denied, `5` not found, `6` rejected as invalid, `7` rate limited,
   `8` partial success, `9` network, `10` unreadable response (including the
   not-yet-rendered download).
+
+## When a command fails
+
+**An error does not mean nothing happened.** `export reports` currently fails
+with a decode error (exit 10) *after* Expensify has run the export job — the
+break is in reading the answer, not in doing the work. Re-running starts a
+second job, and if the first carried `--mark-as-exported` the label is already
+on those reports; a retry applies it again, and there is no unmark. Ask what
+the server already did before you reach for a retry.
+
+| Command | Re-run it with `-vv`? |
+|---|---|
+| `auth status`, `get *`, `download`, `completion`, `skill install --print` | Yes. Nothing server-side to repeat — the same list as *Safe to explore with*. |
+| `export reports`, `export reconciliation` | Only with no `--mark-as-exported` and no `--email*`. With either, the effect has already fired and would fire twice. |
+| `create *`, `update *`, `reimburse` | **Never.** File what the first run gave you — exit code and stderr — and say plainly that there is no transcript because re-running was unsafe. |
+
+Let the exit code choose the next move rather than tracing reflexively. Exit 4
+is a flat refusal with a known cause (account roles), so a transcript adds
+nothing; exits 2, 3 and 7 are the CLI's own verdicts and never need one. A
+decode or HTTP failure is the case worth capturing.
+
+`-vv` is the level that diagnoses a wire mismatch: request as sent with
+credentials redacted, response body verbatim, status and content-type. `-v` is
+a single summary line per call and too coarse; `-vvv` adds h2 frames and only
+helps when the connection, not the payload, is the suspect.
+
+### Filing it
+
+Report the defect at `xrl/expensify-rs` with `gh issue create`, following
+`.github/ISSUE_TEMPLATE/cli-defect.md`.
+
+**Search first** — `gh issue list --repo xrl/expensify-rs --search "export
+reports decode" --state all`, keying on the operation and the symptom. Several
+defects are known and being fixed right now; add a comment to the open issue
+rather than opening a near-duplicate.
+
+Two leaks to close before you post, neither of which the CLI can close for you:
+
+- The CLI redacts its own output, not the command you typed. An invocation
+  carrying `--partner-user-secret VALUE` publishes that credential if you
+  reproduce it verbatim — replace the value.
+- **The repo is public and a `-vv` body is real data**: employee emails, card
+  numbers, merchant names. Name the account the trace came from. From a
+  throwaway trial account the full body is fine; from any account with real
+  people in it, redact the identifying fields and keep the shape, which is the
+  part that carries the diagnosis.
 
 ## Deliberately not offered
 
