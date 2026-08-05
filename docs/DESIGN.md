@@ -886,8 +886,18 @@ private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
   say. The same docs call the parameter restricted and needing advanced
   permissions; a plain policy-admin trial account used it with no grant, so
   that claim is suspect too.
-- `CreatedTransaction { transaction_id, merchant, created: Date,
-  amount_cents, currency }` — Clone, Debug.
+- `CreatedTransaction { transaction_id, report_id, merchant, created: Date,
+  amount_cents, currency }` — Clone, Debug. `report_id` records an
+  **undocumented side effect**: an expense created without
+  `Expense::report_id` is not left loose — Expensify opens a report for it and
+  names that report in the response. Discarding it left callers unable to
+  find their own expense without a separate export. Required rather than
+  `Option`, on the same grounds as the other five fields: it is present in the
+  observed response, and absence would mean the shape moved. The response also
+  carries `comment`, `tag`, `category` and `mcc`, which only echo the request
+  (or Expensify's default for it, e.g. `"Uncategorized"`) and are not
+  modelled; no wire struct sets `deny_unknown_fields`, so a response that
+  grows a field does not fail a created expense.
 
 ### `reports.rs`
 
@@ -1223,7 +1233,8 @@ it is known:
 | Policy Getter, all five sections | observed | correct, both tag shapes included |
 | Downloader → raw file body | observed | correct |
 | Policy Creator → `policyID`/`policyName` | observed | correct; answered as `application/json` |
-| Expense Creator → transaction | observed | matches `CreatedTransaction` field for field |
+| Expense Creator → `transactionList` | observed | envelope and fields as modelled, plus `reportID` (now surfaced — see below) and four echo fields (`comment`, `tag`, `mcc`, `category`) that are ignored |
+| Expense Creator auto-creates a report | observed | **undocumented.** An expense that named no report comes back with a `reportID` Expensify opened for it |
 | Policy Updater (tags, replace) | observed | correct |
 | Expense Rules Creator → `{"responseMessage":"OK","responseCode":200}` | observed | `()` is right — no rule ID exists to return |
 | **Report Exporter submit → bare filename** | observed | **was wrong**: parsed as an envelope, so the flagship operation never worked |

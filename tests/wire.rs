@@ -782,7 +782,7 @@ async fn expense_creator_parses_the_transaction_list() {
         "responseCode": 200,
         "transactionList": [
             { "amount": 12900, "merchant": "Cloud Hosting Inc", "created": "2026-07-31",
-              "transactionID": "T123", "currency": "USD" }
+              "transactionID": "T123", "reportID": "R1", "currency": "USD" }
         ]
     })))
     .await;

@@ -178,9 +178,10 @@ result prints `No <noun> found.` on **stderr** with nothing on stdout, so
 // reimburse --tolerate-partial
 {"updated":["R1"],"skipped":[{"report_id":"R2","reason":"not approved"}],"failed":[]}
 
-// create expenses — array
-[{"transaction_id":"T1","merchant":"Cloud Hosting Inc","date":"2026-07-31",
-  "amount_cents":12900,"currency":"USD"}]
+// create expenses — array. `report_id` is the report Expensify put the
+// expense in, which it opens for you if the expense named none.
+[{"transaction_id":"T1","report_id":"R009WqAY45L1","merchant":"Cloud Hosting Inc",
+  "date":"2026-07-31","amount_cents":12900,"currency":"USD"}]
 
 // writes Expensify answers with no body (create expense-rule, update policy, ...)
 {"result":"created a rule for a@acme.com on 1234ABCD"}
@@ -238,6 +239,9 @@ strictly `YYYY-MM-DD` — `07/01/2026` is a usage error.
   please update rule N`. Plan for that before creating rules you intend to edit.
 - `create expenses` requires `--employee-email`. It does not default to the
   credential owner; without it Expensify answers 410.
+- `create expenses` without `--report-id` does not leave the expense loose:
+  Expensify opens a report for it. The `report_id` column names that report,
+  and it is the only way to find the expense without a separate export.
 - `reimburse` treats a partially applied run as an error (exit 8) — including
   the case Expensify reports as a plain `responseCode: 200` with every report
   skipped, which it does. Add `--tolerate-partial` to get the

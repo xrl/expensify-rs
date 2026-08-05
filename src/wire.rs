@@ -1227,10 +1227,19 @@ struct TransactionListResponse {
     transactions: Vec<TransactionWire>,
 }
 
+/// No `deny_unknown_fields`, deliberately: the observed body also carries
+/// `comment`, `tag`, `category` and `mcc`, and a response growing a field must
+/// not fail a created expense.
 #[derive(Deserialize)]
 struct TransactionWire {
     #[serde(rename = "transactionID")]
     transaction_id: TransactionId,
+    /// Always present in the observed response — Expensify auto-creates a
+    /// report when the expense named none. Required rather than `Option`, on
+    /// the same grounds as every other field here: absence would mean the
+    /// shape moved, and answering `None` would hide that.
+    #[serde(rename = "reportID")]
+    report_id: ReportId,
     merchant: String,
     created: String,
     amount: i64,
@@ -1244,6 +1253,7 @@ pub(crate) fn created_transactions(value: Value) -> Result<Vec<CreatedTransactio
         .map(|wire| {
             Ok(CreatedTransaction {
                 transaction_id: wire.transaction_id,
+                report_id: wire.report_id,
                 merchant: wire.merchant,
                 created: parse_date(&wire.created).ok_or_else(|| {
                     Error::from(DecodeError::custom(format!(

@@ -148,10 +148,22 @@ impl CreateExpensesAction {
 }
 
 /// One created expense, as echoed back by Expensify.
+///
+/// The response also carries `comment`, `tag`, `category` and `mcc`, which
+/// echo the request (or Expensify's defaults for it, e.g. `"Uncategorized"`)
+/// rather than telling the caller anything new. They are not modelled; the
+/// raw body is one `ClientBuilder::observe` away if you need them.
 #[derive(Clone, Debug)]
 pub struct CreatedTransaction {
     /// Assigned identifier.
     pub transaction_id: TransactionId,
+    /// The report the expense landed in.
+    ///
+    /// **Undocumented, and the reason this field exists:** an expense created
+    /// without [`Expense::report_id`] is not left loose. Expensify opens a
+    /// report for it and names that report here, so this is the only way to
+    /// learn where the expense went short of a separate export.
+    pub report_id: ReportId,
     /// Merchant as stored.
     pub merchant: String,
     /// Expense date (`created` on the wire).

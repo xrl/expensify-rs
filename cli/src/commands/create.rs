@@ -69,6 +69,7 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
         "expenses",
         vec![
             "TRANSACTION ID",
+            "REPORT ID",
             "MERCHANT",
             "DATE",
             "AMOUNT CENTS",
@@ -79,6 +80,7 @@ async fn expenses(args: CreateExpensesArgs, global: &GlobalArgs) -> Result<()> {
             .map(|transaction| {
                 vec![
                     transaction.transaction_id.to_string(),
+                    transaction.report_id.to_string(),
                     transaction.merchant.clone(),
                     transaction.created.to_string(),
                     transaction.amount_cents.to_string(),

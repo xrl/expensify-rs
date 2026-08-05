@@ -49,6 +49,8 @@ const REIMBURSE_MIXED: Fixture = Fixture {
     content_type: Some("text/plain;charset=utf-8"),
 };
 
+/// Expense Creator. Carries five fields beyond what this crate models, which
+/// is the case worth pinning: unknown keys must not fail a created expense.
 const CREATE_EXPENSES: Fixture = Fixture {
     body: include_bytes!("fixtures/create-expenses.json"),
     status: 200,
@@ -225,6 +227,12 @@ async fn the_tolerant_path_reports_the_same_body_as_data() {
 /// Omitting `employeeEmail` is a 410 (`'employeeEmail' parameter is missing or
 /// malformed`) with or without a policy, so it is an argument rather than a
 /// setter and always reaches the wire.
+///
+/// The recorded body also carries `comment`, `tag`, `mcc` and `category`,
+/// which this crate does not model. That they are ignored rather than fatal is
+/// a property of the wire structs — no `deny_unknown_fields` anywhere — and is
+/// asserted here rather than assumed, since it is the difference between
+/// tolerating a growing response and getting away with one.
 #[tokio::test]
 async fn the_expense_creator_always_names_the_employee() {
     let server = replaying(&CREATE_EXPENSES).await;
@@ -233,19 +241,19 @@ async fn the_expense_creator_always_names_the_employee() {
         .create_expenses(
             "user@example.com",
             [Expense::new(
-                "Test Merchant",
-                date!(2026 - 08 - 01),
-                Money::new(1234, "USD"),
+                "Fixture Probe",
+                date!(2026 - 08 - 03),
+                Money::new(777, "USD"),
             )],
         )
         .await
         .expect("the recorded response is a success");
 
     let transaction = &created[0];
-    assert_eq!(transaction.transaction_id.as_str(), "286636100957217088");
-    assert_eq!(transaction.merchant, "Test Merchant");
-    assert_eq!(transaction.created, date!(2026 - 08 - 01));
-    assert_eq!(transaction.amount_cents, 1234);
+    assert_eq!(transaction.transaction_id.as_str(), "4056343049275634494");
+    assert_eq!(transaction.merchant, "Fixture Probe");
+    assert_eq!(transaction.created, date!(2026 - 08 - 03));
+    assert_eq!(transaction.amount_cents, 777);
     assert_eq!(transaction.currency.as_str(), "USD");
 
     let requests = server.received_requests().await.expect("recorded requests");
@@ -253,6 +261,33 @@ async fn the_expense_creator_always_names_the_employee() {
         job(&requests[0])["inputSettings"]["employeeEmail"],
         "user@example.com"
     );
+}
+
+/// The expense named no report, and came back in one: Expensify opens a report
+/// for a loose expense and says which. Discarding that left a caller unable to
+/// find their own expense without a separate export.
+#[tokio::test]
+async fn a_created_expense_names_the_report_it_landed_in() {
+    let server = replaying(&CREATE_EXPENSES).await;
+
+    let created = client(&server)
+        .create_expenses(
+            "user@example.com",
+            [Expense::new(
+                "Fixture Probe",
+                date!(2026 - 08 - 03),
+                Money::new(777, "USD"),
+            )],
+        )
+        .await
+        .expect("the recorded response is a success");
+
+    assert_eq!(created[0].report_id.as_str(), "R009WqAY45L1");
+
+    // Nothing in the request asked for a report; the server made one.
+    let requests = server.received_requests().await.expect("recorded requests");
+    let transaction = &job(&requests[0])["inputSettings"]["transactionList"][0];
+    assert!(transaction.get("reportID").is_none(), "{transaction}");
 }
 
 // ---------------------------------------------------------------------------

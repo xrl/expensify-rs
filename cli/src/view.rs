@@ -157,6 +157,8 @@ pub fn created_report(report: &CreatedReport) -> Value {
 pub fn created_transaction(transaction: &CreatedTransaction) -> Value {
     json!({
         "transaction_id": transaction.transaction_id.as_str(),
+        // Expensify opens a report for an expense that named none.
+        "report_id": transaction.report_id.as_str(),
         "merchant": transaction.merchant,
         "date": transaction.created.to_string(),
         "amount_cents": transaction.amount_cents,
