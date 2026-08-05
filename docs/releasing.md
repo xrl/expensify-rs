@@ -21,14 +21,21 @@ request against [`xrl/homebrew-tap`][tap] bumping `Formula/expensify-cli.rb`.
 ## The tap credential
 
 `GITHUB_TOKEN` is scoped to this repository, so it cannot write to the tap. The
-`tap` job needs a repository secret named **`HOMEBREW_TAP_TOKEN`**:
+`tap` job needs a secret named **`HOMEBREW_TAP_TOKEN`**, on the **`release`
+environment** — the same one the publish job uses. A token that can write to
+another repository should be gated like the publishing credentials, not left
+readable by every job in the repo.
 
 - a **fine-grained personal access token**, owned by an account with write
   access to `xrl/homebrew-tap`
 - **repository access:** only `xrl/homebrew-tap`
 - **repository permissions:** `Contents: read and write`, `Pull requests: read
   and write` — nothing else
-- stored in this repo under *Settings → Secrets and variables → Actions*
+- stored in this repo under *Settings → Environments → release → Environment
+  secrets*. A repository secret of the same name will **not** be visible to the
+  `tap` job, which declares `environment: release`; the job reads it as absent
+  and skips with "not configured", so a misplaced secret reports as an unset
+  one.
 
 Fine-grained tokens expire. An expired one fails the job rather than skipping it
 — the secret is still there, so the job cannot tell "not set up" from "set up

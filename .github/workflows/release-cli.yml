@@ -76,6 +76,11 @@ jobs:
     # before they exist.
     needs: binaries
     runs-on: ubuntu-latest
+    # HOMEBREW_TAP_TOKEN is scoped to this environment, not the repository: it
+    # can write to another repo, so it should be gated like the publish job's
+    # credentials. A job that omits this reads the secret as absent and skips
+    # with "not configured" — set correctly, reported as unset.
+    environment: release
     permissions:
       contents: read
     env:
