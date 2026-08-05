@@ -110,8 +110,11 @@ jobs:
         with:
           path: src
 
-      # Cheap, offline, and it runs before anything is written to the tap: a
-      # rewriter regression should not reach a formula everyone installs from.
+      # `ci.yml` already ran this at PR time, which is where a regression should
+      # actually be caught. Kept here too because this is the last point before
+      # an unattended write to a formula everyone installs from, and it costs
+      # seconds. Neither copy is redundant; deleting this one trades a cheap
+      # guard for trusting that nothing reached the tag unreviewed.
       - name: Self-test the rewriter
         if: steps.gate.outputs.have == 'true'
         run: src/.github/scripts/bump-tap-formula-test.sh

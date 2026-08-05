@@ -119,6 +119,18 @@ jobs:
       # 1.88 today; that is not a promise.)
       - run: cargo check --locked --all-features -p expensify
 
+  tap-formula:
+    name: tap formula rewriter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # No toolchain and no cache: shell over committed fixtures, a few seconds.
+      # `release-cli.yml` runs this again immediately before it writes to the
+      # tap — do not delete either as redundant. That one is a last-chance guard
+      # on an unattended cross-repo write; this one is why you find out at PR
+      # time instead of after the tag is cut and crates.io has published.
+      - run: .github/scripts/bump-tap-formula-test.sh
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
