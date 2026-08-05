@@ -1,4 +1,3 @@
-use std::fmt;
 use std::marker::PhantomData;
 
 use time::Date;
@@ -7,6 +6,7 @@ use crate::BoxFuture;
 use crate::client::Client;
 use crate::error::Error;
 use crate::file::{ExportedFile, FileSystem};
+use crate::secret::Secret;
 use crate::template::ExportTemplate;
 use crate::types::{PolicyId, ReportId};
 use crate::wire;
@@ -146,31 +146,21 @@ pub enum ExportFormat {
 /// SFTP endpoint, shared by the exporter's `sftpUpload` action and the
 /// employee updater's SFTP feed source.
 ///
-/// [`fmt::Debug`] redacts [`SftpConnection::password`], for the same reason
-/// [`Credentials`](crate::Credentials) does: this type is reachable from
-/// the `Debug` of [`OnFinish`], every export action, and
-/// [`EmployeeSource`](crate::EmployeeSource).
-#[derive(Clone)]
+/// The password is a [`Secret`], for the same reason
+/// [`Credentials`](crate::Credentials)' is: this type is reachable from the
+/// `Debug` of [`OnFinish`], every export action, and
+/// [`EmployeeSource`](crate::EmployeeSource), so one derived `Debug` anywhere
+/// on that path would print it.
+#[derive(Clone, Debug)]
 pub struct SftpConnection {
     /// Hostname or IP.
     pub host: String,
     /// Username.
     pub login: String,
-    /// Password. Never printed by [`fmt::Debug`].
-    pub password: String,
+    /// Password. `"literal".into()` or `Secret::new(..)`.
+    pub password: Secret<String>,
     /// Port, usually 22.
     pub port: u16,
-}
-
-impl fmt::Debug for SftpConnection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SftpConnection")
-            .field("host", &self.host)
-            .field("login", &self.login)
-            .field("password", &"<redacted>")
-            .field("port", &self.port)
-            .finish()
-    }
 }
 
 /// An `onFinish` action for the Report Exporter.

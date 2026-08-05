@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**Breaking — the next library release must be 0.3.0, not 0.2.1.** Three public
+signatures change shape (below). Everything else here is additive.
+
+- `Secret<T>` and `MaskedUrl`: redaction is now carried by the field's type
+  rather than by a hand-written `Debug` on each holder. `Debug`/`Display`
+  redact, `expose()` is the only read path, and there is no `Serialize` impl —
+  so a secret can only reach the wire through the job builder, which stores it
+  out-of-band and substitutes it in at render time. Breaking:
+  - `Credentials::new`'s second parameter is `impl Into<Secret<String>>`
+    (`&str` and `String` still work; an `Into<String>` type that is not
+    `Into<Secret<String>>` no longer does).
+  - `SftpConnection::password` is `Secret<String>` (public field).
+  - `EmployeeSource::FetchUrl`'s `password` is `Option<Secret<String>>` and
+    its `url` is `MaskedUrl` (public variant fields). `"…".into()` covers both.
+- `ClientBuilder::observe(impl Observer)` reports every request and response:
+  the request body as sent with credentials redacted, and the response status,
+  content-type and raw body. Off by default. `Recorder` captures exchanges in
+  memory, which is the basis for recording live responses as test fixtures.
+  No new dependency. **Observed response bodies contain personal data.**
+- CLI: `-v` logs one line per API call; `-vv` prints the full request and
+  response bodies and warns that responses carry personal data; `-vvv` adds
+  transport tracing. Dependency logging is filtered by target, so `-vv` no
+  longer buries the exchange under `h2` frame noise.
 - CLI: `expensify skill install` writes the Claude Code agent skill embedded in
   the binary (`cli/skill/SKILL.md`) into a personal or repository-local skills
   directory. The library is unchanged.

@@ -35,7 +35,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 pub fn client(global: &GlobalArgs) -> Result<Client> {
     let resolved = resolve(
         global.partner_user_id.as_deref(),
-        global.partner_user_secret.as_deref(),
+        global.partner_user_secret.as_ref(),
         &ProcessEnv,
         &Keychain,
     )?;
@@ -55,6 +55,16 @@ pub fn client(global: &GlobalArgs) -> Result<Client> {
     }
     if global.no_rate_limit {
         builder = builder.no_rate_limiting();
+    }
+    if global.verbose > 0 {
+        if global.verbose > 1 {
+            note(
+                global,
+                "note: -vv prints response bodies verbatim, which routinely carry \
+                 personal data (employee names, email addresses, card numbers)",
+            );
+        }
+        builder = builder.observe(crate::observe::Tracing);
     }
     Ok(builder.build())
 }

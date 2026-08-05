@@ -64,6 +64,16 @@ from Isabel Atkinson's RustConf 2024 talk on the MongoDB Rust driver — see
   if you're pacing requests yourself.
 - **HTTP 200 does not mean success** in this API — the response body carries its
   own status code, and this crate maps it before handing you a result.
+- **Secrets are typed, not remembered.** Every secret is a `Secret<T>`, which
+  redacts in `Debug`/`Display` and cannot be serialized; the wire layer is the
+  only place that unwraps one, so a new secret-bearing field cannot leak
+  through a derived `Debug`.
+- **Observability on every call.** `Client::builder(..).observe(..)` reports
+  the request as sent (credentials redacted) and the raw response — status,
+  content-type, body — for diagnosing a wire mismatch without reaching for
+  curl. Off by default, no extra dependency, and `Recorder` captures exchanges
+  for turning live responses into fixtures. Response bodies contain personal
+  data; treat what you capture accordingly.
 - **rustls only.** No OpenSSL, no system TLS.
 - **`reqwest` is re-exported**, so the types in these signatures (`Url`,
   `reqwest::Client`, `StatusCode`) are nameable without a second dependency.
@@ -97,7 +107,9 @@ Credentials resolve from `--partner-user-id`/`--partner-user-secret`, then
 `EXPENSIFY_PARTNER_USER_ID`/`EXPENSIFY_PARTNER_USER_SECRET`, then the keychain —
 so CI keeps using environment variables without touching a keychain that isn't
 there. `expensify completion <shell>` prints a completion script, and exit codes
-are documented in `expensify --help` for scripts that branch on them.
+are documented in `expensify --help` for scripts that branch on them. `-v`
+logs one line per API call and `-vv` prints the request and response bodies —
+including any personal data the response carries.
 
 ## Status
 

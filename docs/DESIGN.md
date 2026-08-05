@@ -145,13 +145,17 @@ string is absence; a *non-blank* value that will not parse is
 ## Client, credentials, domain scope
 
 ```rust
-pub struct Credentials { partner_user_id: String, partner_user_secret: String } // private fields
-impl Credentials { pub fn new(id: impl Into<String>, secret: impl Into<String>) -> Self }
-// derives: Clone. Debug is MANUAL and redacts the secret — credentials in a
-// log line is the bug this prevents. No Serialize.
+pub struct Credentials { partner_user_id: String, partner_user_secret: Secret<String> }
+impl Credentials {
+    pub fn new(id: impl Into<String>, secret: impl Into<Secret<String>>) -> Self;
+    pub fn partner_user_id(&self) -> &str;      // not a secret; it names the integration
+}
+// derives: Clone, Debug — the derive is safe because the field type redacts.
+// No Serialize. See § Secrets.
 
 #[derive(Clone)] pub struct Client { inner: Arc<ClientInner> }   // cheap clone; actions own one
-// ClientInner (private): reqwest::Client, Credentials, reqwest::Url, Option<RateGate>
+// ClientInner (private): reqwest::Client, Credentials, reqwest::Url,
+//                        Option<RateGate>, Option<Arc<dyn Observer>>
 
 impl Client {
     pub fn new(credentials: Credentials) -> Self;                // prod endpoint, limiter on
@@ -159,7 +163,8 @@ impl Client {
 }
 
 pub struct ClientBuilder;   // base_url(Url), http_client(reqwest::Client),
-                            // no_rate_limiting(), build() -> Client
+                            // no_rate_limiting(), observe(impl Observer),
+                            // build() -> Client
 ```
 
 `reqwest` is re-exported (`expensify::reqwest`, plus `expensify::Url` for the
@@ -186,6 +191,117 @@ impl DomainClient {
 
 This is a *data* scope (the jobs need the domain string), not a
 capability claim — Expensify still 403s non-domain-admin credentials.
+
+## Secrets
+
+Four values in this API are secrets, and they were previously protected by
+hand-written `Debug` impls on the three types that hold them. That is
+discipline: it is correct exactly as long as everyone adding a field
+remembers, and the failure is silent. Two types replace it.
+
+```rust
+pub struct Secret<T = String>(T);          // Clone, PartialEq, Eq
+impl<T> Secret<T> {
+    pub fn new(value: T) -> Self;
+    pub fn expose(&self) -> &T;            // the only read path
+    pub fn into_inner(self) -> T;
+}
+impl<T> From<T> for Secret<T>;  impl From<&str> for Secret<String>;
+// Debug and Display both render `<redacted>`. NO Serialize, NO Deref.
+
+pub struct MaskedUrl(String);              // Clone, PartialEq, Eq
+impl MaskedUrl {
+    pub fn new(url: impl Into<String>) -> Self;
+    pub fn expose(&self) -> &str;          // whole, userinfo included
+    pub fn masked(&self) -> String;        // `https://<redacted>@host/path`
+}
+// From<&str>/<String>/<&Url>. Debug and Display render the masked form.
+```
+
+Applied to: `Credentials::partner_user_secret`, `SftpConnection::password`,
+`EmployeeSource::FetchUrl::password` (all `Secret<String>`),
+`EmployeeSource::FetchUrl::url` (`MaskedUrl`). `Client`'s `base_url` stays a
+`Url` — reqwest needs one — and is printed through `MaskedUrl`.
+
+**Why userinfo is not `Secret<Url>`.** It was the obvious unification and it
+is wrong: `Secret` redacts the whole value, and for a URL the host and path
+are the half you print a URL *for* — deleting them turns "the feed at
+hr.acme.com 404s" into "a feed 404s". Two types, one rule: redacted by
+default in every human-facing rendering, raw only through a named accessor.
+
+**Why `Secret` has no `Serialize`.** Redaction is for humans and the wire
+needs the real value, so the two must not be the same switch. Absent a
+`Serialize` impl, `json!(secret)` does not compile, and the *only* way a
+secret reaches the job description is `JobRequest::secret`, which stores it
+out-of-band and puts an opaque placeholder in the JSON tree. Substitution
+happens once per rendering: real values for the outgoing body, `<redacted>`
+(or `MaskedUrl::masked`) for the observed one. So the observable body is not
+a filtered copy of the real one — it is rendered from a tree that has never
+held a secret, and a new secret-bearing field has to route through the same
+door to compile at all.
+
+What a new field must now do wrong to leak: bypass `Secret`, or call
+`.expose()` and hand the result to `json!` directly. Both are visible in
+review; `tests/secrets.rs` asserts both halves (nothing public prints a
+sentinel; the wire body still carries it) over the public API.
+
+## Observability
+
+Off by default, one hook, every job:
+
+```rust
+pub trait Observer: Send + Sync + 'static {
+    fn on_request(&self, request: &ObservedRequest) {}   // default no-op
+    fn on_exchange(&self, exchange: &Exchange);
+}
+impl<F: Fn(&Exchange) + Send + Sync + 'static> Observer for F {}   // closures
+
+pub struct ObservedRequest;   // url() -> &MaskedUrl, job_type(), job_description(),
+                              // fields() -> impl Iterator<Item = (&str, &str)>, field(name)
+pub struct Exchange;          // request(), status(), content_type(), body() -> &Bytes,
+                              // body_text() -> Cow<str>, duration()
+pub struct Recorder;          // Observer + Clone; exchanges(), take(), len(), is_empty()
+// Both request types: Clone, Debug, Display. Display is the CLI's rendering.
+
+impl ClientBuilder { pub fn observe(self, observer: impl Observer) -> Self }
+```
+
+`ClientInner` holds `Option<Arc<dyn Observer>>`; `None` skips the redacted
+rendering, the timer and the body clone, so the unused cost is one `Option`
+check per request. The hook sits in `Client::raw`, the one function both
+`send` and `send_download` go through — there is no per-operation opt-in to
+forget.
+
+Two callbacks rather than one, because a request that never answers is
+exactly when you want to see it: `on_request` fires before the send, so a
+connection failure still shows what went out (it then surfaces as
+`Error::Transport`, and there is no exchange to report). `Exchange` therefore
+needs no `Option<StatusCode>`.
+
+**Dependency argument: no new dependency.** `tracing` is the idiomatic choice
+and is nearly free without a subscriber, but it cannot do the thing this
+feature exists for twice over. Capturing exchanges through `tracing` means
+writing a `Subscriber`, rendering typed data into formatted fields and
+parsing it back — structure to string to structure — where a callback hands
+over the bytes. And the library would gain a semver-relevant dependency to
+serve a decision (what a log line is) that belongs to the binary. The CLI,
+which already runs a subscriber, bridges the two in one 25-line file
+(`cli/src/observe.rs`). The reverse arrangement cannot produce fixtures.
+
+**Fixture recording**, concretely: install a `Recorder`, run the real call
+once against live credentials, then for each exchange write
+`exchange.body()` to `tests/fixtures/<job_type>-<case>.json` and keep
+`status()` and `content_type()` beside it. A test replays those bytes through
+a mock server — `tests/observe.rs::a_recorded_body_replays_as_a_fixture` does
+exactly this round trip — so the assertion is against what Expensify said,
+not against what this crate inferred it would say. That is the difference
+that matters for a wire layer built from prose docs.
+
+**Response bodies carry personal data** — employee names, emails, manager
+chains, masked card numbers. Stated on `Observer`, on `ClientBuilder::observe`,
+in the `observe` module docs, in the CLI's `--help`, and printed to stderr by
+the CLI whenever `-vv` is on, because the realistic failure is a verbose log
+pasted into a ticket.
 
 ## The action pattern
 
@@ -327,11 +443,12 @@ surfaces as a decode error, not silent corruption.
 `sftp_upload(SftpConnection)`. `message` lives on its own type because it
 is meaningful for no other action; on the shared `OnFinish` it was a setter
 that compiled and did nothing (misuse 17).
-`SftpConnection { host, login, password, port: u16 }` (Clone; public
-fields; shared with the employee updater's SFTP source). `Debug` is
-**manual and redacts `password`** — same rule as `Credentials`, and it
-matters more here because `SftpConnection` is reachable from the `Debug` of
-`OnFinish`, of every export action, and of `EmployeeSource`.
+`SftpConnection { host, login, password: Secret<String>, port: u16 }`
+(Clone, Debug; public fields; shared with the employee updater's SFTP
+source). The password is a `Secret` rather than a hand-written `Debug` —
+same rule as `Credentials`, and it matters more here because
+`SftpConnection` is reachable from the `Debug` of `OnFinish`, of every export
+action, and of `EmployeeSource`.
 
 `ReconcileAction<F>` (`DomainClient::reconcile`): required args carry
 `start`, `end`, `ReconciliationScope::{Unreported, All}`; setters
@@ -563,6 +680,19 @@ derives, and intent per module. Derives shorthand: **SD** =
   currency)`. Pairs the two fields Expensify always requires together;
   bare `i64` cents appear only in parameters explicitly named `*_cents`.
 
+### `secret.rs`
+
+`Secret<T = String>` (Clone, PartialEq, Eq; `Debug`/`Display` redact; no
+`Serialize`, no `Deref`), `MaskedUrl` (same, masking only the userinfo). See
+[§ Secrets](#secrets).
+
+### `observe.rs`
+
+`Observer` (trait; `on_request` defaults to a no-op, blanket impl for
+`Fn(&Exchange)`), `ObservedRequest`, `Exchange`, `Recorder` — all Clone,
+Debug, and the two request/response types also Display. See
+[§ Observability](#observability).
+
 ### `error.rs`
 
 ```rust
@@ -606,7 +736,8 @@ Covered in [§ Exports](#exports-templates-files-download). Inventory:
 `ReportsQuery` (Clone, Debug), `ReportState` (Copy, Eq — Open, Submitted,
 Approved, Reimbursed, Archived), `ExportFormat` (Copy, Eq — Csv, Xls,
 Xlsx, Txt, Json, Xml; **no `Pdf`** — see open question 4),
-`SftpConnection` (Clone, Debug, pub fields), `OnFinish` (Clone, Debug;
+`SftpConnection` (Clone, Debug, pub fields; `password: Secret<String>`),
+`OnFinish` (Clone, Debug;
 private enum inside), `EmailOnFinish` (Clone, Debug; `Into<OnFinish>`),
 `ExportReportsAction<F>`.
 
@@ -745,15 +876,15 @@ documents no response body for these jobs.
   email-change/merge detection and auto-fills Custom Field 1;
   `domain_group_id` only applies if every record has one.
 - `EmployeeSource` — `Inline(Vec<Employee>)` (`dataSource: "request"`),
-  `FetchUrl { url, user, password }` (`"download"`),
-  `Sftp { connection: SftpConnection, filename }` (`"sftp"`). An enum,
-  not typestate: three mutually exclusive wire shapes, no sequencing.
-  Clone; `Debug` is manual and redacts the feed password *and* any
-  `user:pass@` in the feed URL — `https://user:pass@host/feed.json` is a
-  natural way to spell a basic-auth feed, so the URL is a secret carrier
-  too. Same treatment on `Client`'s `Debug` for a caller-set `base_url`
-  (`url::Url`'s own `Debug` prints `password` verbatim). Host and path
-  survive both, which is why the URL is printed at all.
+  `FetchUrl { url: MaskedUrl, user, password: Option<Secret<String>> }`
+  (`"download"`), `Sftp { connection: SftpConnection, filename }`
+  (`"sftp"`). An enum, not typestate: three mutually exclusive wire shapes,
+  no sequencing. Clone, Debug — both derived, because the field types
+  redact. `https://user:pass@host/feed.json` is a natural way to spell a
+  basic-auth feed, so the URL is a secret carrier too; `MaskedUrl` keeps its
+  host and path, which is why it is printed at all. Same treatment for a
+  caller-set `base_url` (`url::Url`'s own `Debug` prints `password`
+  verbatim). See § Secrets.
 - `PrimaryPolicyMode` — None, NewEmployees, AllEmployees.
 - `UpdateEmployeesAction` — `.dry_run()`, `.primary_policy(mode)`,
   `.no_approval_chain_fixes()` (server default on),
@@ -818,6 +949,13 @@ than an internal retry. No auto-retry in v1 (see Open questions).
 | `thiserror` | error derives |
 | dev: `tokio` (macros, rt) | examples/tests only — the lib itself is runtime-agnostic-by-accident (reqwest requires tokio anyway, so no abstraction layer is designed) |
 
+Unchanged by observability: the callback hook needs nothing `std` does not
+already provide, which is half of why it was chosen over `tracing`. See
+[§ Observability](#observability). The CLI (a separate crate, not on this
+table) turned on `tracing-subscriber`'s `registry` feature so it can filter
+by target — a single global level cannot show our diagnostics without also
+showing `h2`'s frame handling.
+
 Features: `employee-updater-deprecated` (default off) gates the one
 multipart job and its reqwest feature — deprecated upstream, and the only
 consumer of multipart. No other flags: everything else is small, and
@@ -835,6 +973,8 @@ src/
   file.rs           # FileSystem, ExportedFile, DownloadAction
   export.rs         # ReportsQuery, ReportState, ExportFormat, OnFinish, EmailOnFinish, SftpConnection, ExportReportsAction
   reconciliation.rs # ReconciliationScope, ReconciliationFormat, ReconcileAction
+  observe.rs        # Observer, ObservedRequest, Exchange, Recorder
+  secret.rs         # Secret<T>, MaskedUrl
   policy/           # mod, model, get, list, create, update, approvers
   expenses.rs       # Expense, ExpenseTax, CreateExpensesAction, CreatedTransaction
   reports.rs        # ExpenseLine, CreateReportAction, ReimburseTargets/Action/Outcome
@@ -927,6 +1067,11 @@ Each entry is a `trybuild` case under `tests/ui/` with a committed
 18. **An exporter-only format on the reconciliation job** (which accepts
     only csv/txt/json/xml): `.format(ExportFormat::Xlsx)` — E0308, the
     setter takes the narrower `ReconciliationFormat`. Same split as case 13.
+
+19. **Reading a secret without saying so.** `Secret` is not a smart pointer:
+    `&*secret` is E0614, "type `Secret` cannot be dereferenced". `expose()`
+    is the only read path, which is what makes every use of a secret
+    greppable — and what lets the wire layer be the only place that calls it.
 
 Runtime-but-loud (not compile errors, by design): empty collections are
 `Error::InvalidRequest` before anything is sent (case 7); destructive tag/

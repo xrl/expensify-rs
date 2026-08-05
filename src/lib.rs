@@ -49,6 +49,22 @@
 //! [`ClientBuilder::no_rate_limiting`] when an external governor owns the
 //! budget. The limiter is process-local, so 429s remain a surfaced error.
 //!
+//! # Secrets
+//!
+//! Every secret in the API is a [`Secret<T>`](Secret), which redacts in
+//! `Debug` and `Display` and has no `Serialize` impl, so a struct holding one
+//! can derive `Debug` and still not leak. URLs that may embed `user:pass@` are
+//! [`MaskedUrl`], which masks the userinfo and keeps the host and path.
+//!
+//! # Observability
+//!
+//! [`ClientBuilder::observe`] installs an [`Observer`] over *every* job:
+//! the request body as sent (credentials redacted), the response status,
+//! content-type and raw body. It is off by default and costs one `Option`
+//! check when off. [`Recorder`] captures exchanges in memory — the basis for
+//! turning live responses into test fixtures. **Response bodies contain
+//! personal data**; see [`observe`].
+//!
 //! [api]: https://integrations.expensify.com/Integration-Server/doc/
 #![deny(missing_docs)]
 
@@ -61,9 +77,11 @@ mod expenses;
 mod export;
 mod file;
 mod limit;
+pub mod observe;
 mod policy;
 mod reconciliation;
 mod reports;
+mod secret;
 mod template;
 mod types;
 mod wire;
@@ -90,9 +108,11 @@ pub use expense_rules::*;
 pub use expenses::*;
 pub use export::*;
 pub use file::*;
+pub use observe::{Exchange, ObservedRequest, Observer, Recorder};
 pub use policy::*;
 pub use reconciliation::*;
 pub use reports::*;
+pub use secret::{MaskedUrl, Secret};
 pub use template::*;
 pub use types::*;
 

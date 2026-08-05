@@ -28,6 +28,18 @@ $ expensify completion <SHELL>
 $ expensify skill install
 ```
 
+## Seeing the wire
+
+`-v` logs one line per API call — job type, endpoint, status, size, timing.
+`-vv` adds the whole exchange: the request body as sent with credentials
+redacted, and the response body verbatim with its content-type, which is what
+you need when Expensify answers something other than the documented envelope.
+`-vvv` adds transport tracing from the HTTP stack.
+
+**`-vv` prints response bodies as they arrived**, and those routinely contain
+employee names, email addresses and masked card numbers. Read a log before
+pasting it into a ticket.
+
 ## Credentials
 
 Generate a partner pair at <https://www.expensify.com/tools/integrations/>.

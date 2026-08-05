@@ -246,3 +246,60 @@ fn tags_can_only_be_replaced_never_merged() {
     assert!(help.contains("--tags"), "{help}");
     assert!(!help.contains("--merge-tags"), "{help}");
 }
+
+/// The verbosity ladder, exercised against a closed port: the request is
+/// reported before anything can come back, which is the case `-v` exists for.
+/// Nothing is listening on port 1, so this reaches the network stack and no
+/// further.
+#[test]
+fn verbose_reports_the_request_before_the_failure() {
+    let args = &[
+        "--partner-user-id",
+        "test-id",
+        "--partner-user-secret",
+        "test-secret-not-real",
+        "--endpoint",
+        "http://127.0.0.1:1/",
+        "get",
+        "policies",
+    ];
+
+    let quiet = expensify(args);
+    assert_eq!(code(&quiet), 9, "{}", stderr(&quiet));
+    assert!(
+        !stderr(&quiet).contains("job=\"get\""),
+        "silent by default: {}",
+        stderr(&quiet)
+    );
+
+    let mut verbose = vec!["-v"];
+    verbose.extend_from_slice(args);
+    let verbose = expensify(&verbose);
+    assert_eq!(code(&verbose), 9, "{}", stderr(&verbose));
+    let output = stderr(&verbose);
+    assert!(output.contains("request"), "{output}");
+    assert!(output.contains("get"), "{output}");
+    // No secret, at any level.
+    assert!(!output.contains("test-secret-not-real"), "{output}");
+
+    let mut louder = vec!["-vv"];
+    louder.extend_from_slice(args);
+    let louder = expensify(&louder);
+    let output = stderr(&louder);
+    // -vv is where the body of the request appears, and where the warning
+    // about what a response body may contain has to appear with it.
+    assert!(output.contains("requestJobDescription="), "{output}");
+    assert!(output.contains("personal data"), "{output}");
+    assert!(output.contains("<redacted>"), "{output}");
+    assert!(!output.contains("test-secret-not-real"), "{output}");
+}
+
+/// The levels are a documented interface, including the warning about what
+/// the deepest one prints.
+#[test]
+fn the_verbosity_levels_are_documented() {
+    let help = String::from_utf8_lossy(&expensify(&["--help"]).stdout).into_owned();
+    for expected in ["-vv ", "-vvv ", "personal data", "credentials redacted"] {
+        assert!(help.contains(expected), "{help}");
+    }
+}

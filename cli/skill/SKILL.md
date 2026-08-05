@@ -233,6 +233,11 @@ strictly `YYYY-MM-DD` — `07/01/2026` is a usage error.
   automatically; `--no-rate-limit` opts out. The limiter is per-process, so
   several processes sharing one credential pair still need pacing of their own.
   A 429 is exit 7 with no auto-retry.
+- Exit 10 ("unreadable response") is the one to re-run with `-vv`: it prints
+  the request as sent, credentials redacted, and the raw response body with
+  its content-type, which is normally enough to see what Expensify actually
+  answered. Response bodies contain employee names and email addresses — do
+  not paste that output anywhere without reading it first.
 - Useful exit codes for branching: `2` usage, `3` no credentials, `4`
   permission denied, `5` not found, `6` rejected as invalid, `7` rate limited,
   `8` partial success, `9` network, `10` unreadable response (including the

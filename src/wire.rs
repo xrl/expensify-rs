@@ -11,6 +11,8 @@
 //! raw file content rather than an envelope.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 use reqwest::StatusCode;
@@ -22,6 +24,7 @@ use time::format_description::BorrowedFormatItem;
 use time::macros::format_description;
 use time::{Date, PrimitiveDateTime};
 
+use crate::Url;
 use crate::cards::DomainCard;
 use crate::client::Client;
 use crate::employees::{
@@ -36,6 +39,7 @@ use crate::export::{
     SftpConnection,
 };
 use crate::file::FileSystem;
+use crate::observe::{Exchange, ObservedRequest};
 use crate::policy::{
     CreatedPolicy, ListPoliciesAction, PolicyField, PolicyPlan, PolicySummary,
     SetTagApproversAction, TagApprover, TagsSource, UpdateMode, UpdatePolicyAction,
@@ -44,6 +48,7 @@ use crate::reconciliation::{ReconcileAction, ReconciliationFormat, Reconciliatio
 use crate::reports::{
     CreateReportAction, CreatedReport, ReimburseOutcome, ReimburseTargets, SkippedReport,
 };
+use crate::secret::{MaskedUrl, REDACTED, Secret};
 use crate::types::{Currency, PolicyId, ReportId, TransactionId};
 
 /// The form field carrying the JSON job description.
@@ -188,6 +193,12 @@ pub(crate) struct JobRequest {
     /// Merged into `credentials` alongside the partner ID/secret — the
     /// employee updater's feed access lives there.
     credential_extras: Map<String, Value>,
+    /// Everything this job carries that an observer may not see verbatim.
+    /// `job` holds placeholders pointing here; see [`JobRequest::secret`].
+    concealed: Vec<Concealed>,
+    /// Distinguishes this job's placeholders from any string a caller could
+    /// supply, since caller data and placeholders share one JSON tree.
+    nonce: u64,
     template: Option<String>,
     file: Option<String>,
     data: Option<String>,
@@ -202,12 +213,39 @@ impl JobRequest {
         Self {
             job,
             credential_extras: Map::new(),
+            concealed: Vec::new(),
+            nonce: NEXT_NONCE.fetch_add(1, Ordering::Relaxed),
             template: None,
             file: None,
             data: None,
             #[cfg(feature = "employee-updater-deprecated")]
             multipart_data: None,
         }
+    }
+
+    /// The only way a [`Secret`] reaches the job description.
+    ///
+    /// It returns a placeholder, not the value: the job tree never holds a
+    /// secret, so the rendering an observer sees cannot leak one by omission.
+    /// `Secret` implements no `Serialize`, so `json!(a_secret)` does not
+    /// compile and this is the path a new secret-bearing field has to take.
+    fn secret(&mut self, value: &Secret<String>) -> Value {
+        self.conceal(Concealed::Whole(value.clone()))
+    }
+
+    /// The same, for a URL Expensify needs whole (`user:pass@` included) but
+    /// an observer may only see masked.
+    fn masked_url(&mut self, url: &MaskedUrl) -> Value {
+        self.conceal(Concealed::Url(url.clone()))
+    }
+
+    fn conceal(&mut self, value: Concealed) -> Value {
+        self.concealed.push(value);
+        Value::String(format!(
+            "{PLACEHOLDER}{}:{}{PLACEHOLDER}",
+            self.nonce,
+            self.concealed.len() - 1
+        ))
     }
 
     fn set(mut self, key: &str, value: Value) -> Self {
@@ -243,6 +281,33 @@ impl JobRequest {
         &self.job
     }
 
+    /// The job description with secrets substituted in, as it goes out.
+    #[cfg(test)]
+    pub(crate) fn wire_job(&self) -> Value {
+        self.render_for(&self.job, Render::Wire)
+    }
+
+    /// The same, as an observer would see it.
+    #[cfg(test)]
+    pub(crate) fn observed_job(&self) -> Value {
+        self.render_for(&self.job, Render::Observed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wire_credential_extras(&self) -> Value {
+        self.render_for(&self.credential_extras, Render::Wire)
+    }
+
+    #[cfg(test)]
+    fn render_for(&self, map: &Map<String, Value>, mode: Render) -> Value {
+        render(
+            &Value::Object(map.clone()),
+            &self.concealed,
+            self.nonce,
+            mode,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn input(&self) -> &Map<String, Value> {
         self.job["inputSettings"]
@@ -265,31 +330,149 @@ impl JobRequest {
         self.data.as_deref()
     }
 
-    fn finish(mut self, client: &Client) -> (Map<String, Value>, Vec<(&'static str, String)>) {
-        let mut credentials = self.credential_extras;
+    /// Seal the job: attach credentials and render the form fields.
+    ///
+    /// `observe` decides whether the second, redacted rendering is produced at
+    /// all — nobody watching means no extra tree walk and no extra string.
+    fn finish(mut self, client: &Client, observe: bool) -> Rendered {
+        let partner_secret = self.secret(&client.inner.credentials.partner_user_secret);
+        let mut credentials = std::mem::take(&mut self.credential_extras);
         credentials.insert(
             "partnerUserID".to_owned(),
             json!(client.inner.credentials.partner_user_id),
         );
-        credentials.insert(
-            "partnerUserSecret".to_owned(),
-            json!(client.inner.credentials.partner_user_secret),
-        );
+        credentials.insert("partnerUserSecret".to_owned(), partner_secret);
         self.job
             .insert("credentials".to_owned(), Value::Object(credentials));
 
-        let mut fields: Vec<(&'static str, String)> = Vec::new();
+        let job_type = self
+            .job
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let job = Value::Object(self.job);
+
+        let mut extras: Vec<(&'static str, String)> = Vec::new();
         if let Some(template) = self.template {
-            fields.push(("template", template));
+            extras.push(("template", template));
         }
         if let Some(file) = self.file {
-            fields.push(("file", file));
+            extras.push(("file", file));
         }
         if let Some(data) = self.data {
-            fields.push(("data", data));
+            extras.push(("data", data));
         }
-        (self.job, fields)
+
+        Rendered {
+            job_type,
+            description: render(&job, &self.concealed, self.nonce, Render::Wire).to_string(),
+            observed_description: observe
+                .then(|| render(&job, &self.concealed, self.nonce, Render::Observed).to_string()),
+            extras,
+        }
     }
+}
+
+/// A job description rendered for sending, and — when someone is watching —
+/// again with its secrets replaced.
+struct Rendered {
+    job_type: String,
+    description: String,
+    observed_description: Option<String>,
+    /// `template` / `file` / `data`. No secret rides in any of them.
+    extras: Vec<(&'static str, String)>,
+}
+
+impl Rendered {
+    fn fields(&self) -> Vec<(&str, &str)> {
+        let mut fields = vec![(JOB_FIELD, self.description.as_str())];
+        fields.extend(self.extras.iter().map(|(k, v)| (*k, v.as_str())));
+        fields
+    }
+
+    fn observed(&self, url: &Url) -> Option<ObservedRequest> {
+        let description = self.observed_description.clone()?;
+        let mut fields = vec![(JOB_FIELD, description)];
+        fields.extend(self.extras.iter().cloned());
+        Some(ObservedRequest::new(
+            MaskedUrl::from(url),
+            self.job_type.clone(),
+            fields,
+        ))
+    }
+}
+
+/// Delimits a secret placeholder. A control character on both ends: caller
+/// data that collides with this is not reachable through any documented
+/// Expensify field, and the nonce makes a collision unguessable anyway.
+const PLACEHOLDER: &str = "\u{1}expensify-secret\u{1}";
+
+static NEXT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// A value the wire needs whole and an observer may not have.
+enum Concealed {
+    /// Nothing about it is printable.
+    Whole(Secret<String>),
+    /// Only the `user:pass@` is; the host and path are the diagnosis.
+    Url(MaskedUrl),
+}
+
+impl Concealed {
+    fn wire(&self) -> String {
+        match self {
+            Self::Whole(secret) => secret.expose().clone(),
+            Self::Url(url) => url.expose().to_owned(),
+        }
+    }
+
+    fn observed(&self) -> String {
+        match self {
+            Self::Whole(_) => REDACTED.to_owned(),
+            Self::Url(url) => url.masked(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Render {
+    /// Substitute the real values — the body that goes out.
+    Wire,
+    /// Substitute the redacted forms — the body an observer may see.
+    Observed,
+}
+
+fn render(value: &Value, concealed: &[Concealed], nonce: u64, mode: Render) -> Value {
+    match value {
+        Value::String(raw) => match slot(raw, nonce).and_then(|index| concealed.get(index)) {
+            Some(hidden) => Value::String(match mode {
+                Render::Wire => hidden.wire(),
+                Render::Observed => hidden.observed(),
+            }),
+            None => value.clone(),
+        },
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| render(item, concealed, nonce, mode))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), render(item, concealed, nonce, mode)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn slot(raw: &str, nonce: u64) -> Option<usize> {
+    let body = raw.strip_prefix(PLACEHOLDER)?.strip_suffix(PLACEHOLDER)?;
+    let (found, index) = body.split_once(':')?;
+    if found.parse::<u64>().ok()? != nonce {
+        return None;
+    }
+    index.parse().ok()
 }
 
 impl Client {
@@ -313,8 +496,17 @@ impl Client {
         #[cfg(feature = "employee-updater-deprecated")]
         let multipart = request.multipart_data.clone();
 
-        let (job, fields) = request.finish(self);
-        let description = Value::Object(job).to_string();
+        let observer = self.inner.observer.clone();
+        let rendered = request.finish(self, observer.is_some());
+        let observed = observer
+            .as_ref()
+            .and_then(|_| rendered.observed(&self.inner.base_url));
+        if let (Some(observer), Some(request)) = (&observer, &observed) {
+            observer.on_request(request);
+        }
+        // Started after the rate-limit wait, so the duration is the server's
+        // and not this crate's.
+        let started = observed.as_ref().map(|_| Instant::now());
 
         let builder = self.inner.http.post(self.inner.base_url.clone());
 
@@ -322,33 +514,42 @@ impl Client {
         let builder = match multipart {
             Some(csv) => {
                 let form = reqwest::multipart::Form::new()
-                    .text(JOB_FIELD, description.clone())
+                    .text(JOB_FIELD, rendered.description.clone())
                     .part(
                         "data",
                         reqwest::multipart::Part::stream(csv).file_name("employees.csv"),
                     );
                 builder.multipart(form)
             }
-            None => builder.form(&form_fields(&description, &fields)),
+            None => builder.form(&rendered.fields()),
         };
         #[cfg(not(feature = "employee-updater-deprecated"))]
-        let builder = builder.form(&form_fields(&description, &fields));
+        let builder = builder.form(&rendered.fields());
 
         let response = builder.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
         let body = response.bytes().await?;
+
+        if let (Some(observer), Some(request), Some(started)) = (observer, observed, started) {
+            observer.on_exchange(&Exchange::new(
+                request,
+                status,
+                content_type(&headers),
+                body.clone(),
+                started.elapsed(),
+            ));
+        }
         Ok((status, headers, body))
     }
 }
 
-fn form_fields<'a>(
-    description: &'a str,
-    extras: &'a [(&'static str, String)],
-) -> Vec<(&'a str, &'a str)> {
-    let mut fields = vec![(JOB_FIELD, description)];
-    fields.extend(extras.iter().map(|(k, v)| (*k, v.as_str())));
-    fields
+fn content_type(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -544,16 +745,17 @@ fn filters(query: &ReportsQuery) -> Map<String, Value> {
     filters
 }
 
-fn sftp_data(connection: &SftpConnection) -> Value {
+fn sftp_data(request: &mut JobRequest, connection: &SftpConnection) -> Value {
+    let password = request.secret(&connection.password);
     json!({
         "host": connection.host,
         "login": connection.login,
-        "password": connection.password,
+        "password": password,
         "port": connection.port,
     })
 }
 
-fn on_finish(action: &OnFinish) -> Value {
+fn on_finish(request: &mut JobRequest, action: &OnFinish) -> Value {
     match &action.kind {
         OnFinishKind::MarkAsExported { label } => {
             json!({ "actionName": "markAsExported", "label": label })
@@ -570,7 +772,7 @@ fn on_finish(action: &OnFinish) -> Value {
         }
         OnFinishKind::SftpUpload(connection) => json!({
             "actionName": "sftpUpload",
-            "sftpData": sftp_data(connection),
+            "sftpData": sftp_data(request, connection),
         }),
     }
 }
@@ -607,11 +809,12 @@ pub(crate) fn export_reports<F>(action: &ExportReportsAction<F>) -> JobRequest {
         .set("outputSettings", Value::Object(output))
         .template(&action.template);
 
-    if !action.on_finish.is_empty() {
-        request = request.set(
-            "onFinish",
-            Value::Array(action.on_finish.iter().map(on_finish).collect()),
-        );
+    let mut finishers = Vec::with_capacity(action.on_finish.len());
+    for action in &action.on_finish {
+        finishers.push(on_finish(&mut request, action));
+    }
+    if !finishers.is_empty() {
+        request = request.set("onFinish", Value::Array(finishers));
     }
     if action.test {
         // The doc's parameter table types `test` as String, not boolean. If
@@ -1162,18 +1365,24 @@ pub(crate) fn update_employees(action: &UpdateEmployeesAction) -> JobRequest {
             password,
         } => {
             request = request.set("dataSource", json!("download"));
+            let feed_url = request.masked_url(url);
             request
                 .credential_extras
-                .insert("feedUrl".to_owned(), json!(url));
+                .insert("feedUrl".to_owned(), feed_url);
             opt!(request.credential_extras, "feedUser", user);
-            opt!(request.credential_extras, "feedPassword", password);
+            if let Some(password) = password {
+                let slot = request.secret(password);
+                request
+                    .credential_extras
+                    .insert("feedPassword".to_owned(), slot);
+            }
         }
         EmployeeSource::Sftp {
             connection,
             filename,
         } => {
             request = request.set("dataSource", json!("sftp"));
-            let mut sftp = sftp_data(connection);
+            let mut sftp = sftp_data(&mut request, connection);
             if let Some(map) = sftp.as_object_mut() {
                 map.insert("filename".to_owned(), json!(filename));
             }
@@ -1548,7 +1757,8 @@ mod tests {
                 password: "hunter2-super-secret".into(),
                 port: 22,
             }));
-        let job = export_reports(&action).description().clone();
+        let request = export_reports(&action);
+        let job = request.wire_job();
 
         assert_eq!(job["onFinish"][0]["actionName"], "email");
         // Comma-separated string, not an array.
@@ -1561,6 +1771,11 @@ mod tests {
             "hunter2-super-secret"
         );
         assert_eq!(job["onFinish"][1]["sftpData"]["port"], json!(22));
+
+        // The same field, as an observer sees it.
+        let observed = request.observed_job();
+        assert_eq!(observed["onFinish"][1]["sftpData"]["password"], REDACTED);
+        assert_eq!(observed["onFinish"][1]["sftpData"]["host"], "sftp.acme.com");
     }
 
     #[test]
@@ -1574,14 +1789,9 @@ mod tests {
         let request = update_employees(&action);
         assert_eq!(request.description()["dataSource"], "download");
         // Not in inputSettings: the feed credentials nest in `credentials`.
-        assert_eq!(
-            request.credential_extras["feedUrl"],
-            "https://hr.acme.com/feed.json"
-        );
-        assert_eq!(
-            request.credential_extras["feedPassword"],
-            "hunter2-super-secret"
-        );
+        let extras = request.wire_credential_extras();
+        assert_eq!(extras["feedUrl"], "https://hr.acme.com/feed.json");
+        assert_eq!(extras["feedPassword"], "hunter2-super-secret");
 
         let action = client.update_employees(EmployeeSource::Sftp {
             connection: SftpConnection {
