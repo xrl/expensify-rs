@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   # `release-cli.yml` calls this with upload: true once a CLI tag is green.
   workflow_call:
     inputs:
@@ -40,16 +41,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: ./.github/actions/rust-setup
         with:
-          toolchain: stable
           # Every target here is its runner's host, so this is a no-op that
           # turns a wrong runner label into a link error instead of a binary
           # mislabelled by the archive name.
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          key: bin-${{ matrix.target }}
+          # Warmed on main by warm-cache.yml. These are the longest jobs in the
+          # pipeline and the release profile shares nothing with CI's debug
+          # artifacts, so without that they recompile the graph every run.
+          cache-key: rel-${{ matrix.target }}
 
       - run: cargo build --release --locked -p expensify-cli --target ${{ matrix.target }}
 
