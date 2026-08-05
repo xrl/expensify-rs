@@ -69,3 +69,135 @@ jobs:
     uses: ./.github/workflows/binaries.yml
     with:
       upload: true
+
+  tap:
+    name: homebrew tap pr
+    # The formula's digests are the released archives', so this cannot run
+    # before they exist.
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TAP_REPO: xrl/homebrew-tap
+      FORMULA: Formula/expensify-cli.rb
+    steps:
+      # `secrets` is not available to a job- or step-level `if`, so the gate has
+      # to be a step that reads it into env. Skipping is the point: crates.io is
+      # already published by now, and a red run for a missing tap credential
+      # teaches people to ignore red runs.
+      - name: Check for a tap credential
+        id: gate
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -n "${TAP_TOKEN:-}" ]; then
+            echo "have=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "have=false" >>"$GITHUB_OUTPUT"
+          echo "::notice title=Homebrew tap not updated::Set the HOMEBREW_TAP_TOKEN secret to have releases open a formula PR against ${TAP_REPO}."
+          {
+            echo "### Homebrew tap not updated"
+            echo
+            echo "\`HOMEBREW_TAP_TOKEN\` is not set, so no formula PR was opened against"
+            echo "\`${TAP_REPO}\`. The release itself is unaffected — bump the formula by hand,"
+            echo "or see \`docs/releasing.md\` for the credential to create."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.have == 'true'
+        with:
+          path: src
+
+      # `ci.yml` already ran this at PR time, which is where a regression should
+      # actually be caught. Kept here too because this is the last point before
+      # an unattended write to a formula everyone installs from, and it costs
+      # seconds. Neither copy is redundant; deleting this one trades a cheap
+      # guard for trusting that nothing reached the tag unreviewed.
+      - name: Self-test the rewriter
+        if: steps.gate.outputs.have == 'true'
+        run: src/.github/scripts/bump-tap-formula-test.sh
+
+      - name: Download the release archives
+        if: steps.gate.outputs.have == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir assets
+          cd assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
+          cat ./*.tar.gz.sha256 >digests.txt
+          # The sidecars are what the formula will carry, so they are what has to
+          # be right — checking them against the archives as published catches a
+          # corrupted upload here instead of in `brew install`.
+          shasum -a 256 -c digests.txt
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.have == 'true'
+        with:
+          repository: ${{ env.TAP_REPO }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Open the formula PR
+        if: steps.gate.outputs.have == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#expensify-cli-}"
+          branch="expensify-cli-${version}"
+          release="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --depth 1 origin main
+          base="$(git rev-parse FETCH_HEAD)"
+
+          # Rerunning a release must land on the same branch, not open a second
+          # PR — and must not need a force-push to do it.
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch --depth 1 origin "$branch"
+            git checkout -B "$branch" FETCH_HEAD
+          else
+            git checkout -B "$branch" "$base"
+          fi
+
+          ../src/.github/scripts/bump-tap-formula.sh \
+            "$FORMULA" "$version" "$TAG" ../assets/digests.txt
+
+          if ! git diff --quiet -- "$FORMULA"; then
+            git commit -m "expensify-cli ${version}" -- "$FORMULA"
+          fi
+
+          if git diff --quiet "$base" HEAD -- "$FORMULA"; then
+            echo "::notice title=Homebrew tap already current::${TAP_REPO} already serves ${version}."
+            exit 0
+          fi
+
+          git push origin "$branch"
+
+          if [ -n "$(gh pr list --repo "$TAP_REPO" --head "$branch" --state all --json number --jq '.[].number')" ]; then
+            echo "::notice title=Homebrew tap PR exists::A PR for ${branch} is already open on ${TAP_REPO}."
+            exit 0
+          fi
+
+          {
+            echo "\`expensify-cli ${version}\` — ${release}"
+            echo
+            echo "| archive | sha256 |"
+            echo "| --- | --- |"
+            awk '{ printf "| `%s` | `%s` |\n", $2, $1 }' ../assets/digests.txt
+            echo
+            echo "Digests are the release's published \`.sha256\` sidecars, each re-verified"
+            echo "against the archive it names. Opened by \`Release CLI\` in ${GITHUB_REPOSITORY}."
+          } >../body.md
+
+          gh pr create --repo "$TAP_REPO" --head "$branch" --base main \
+            --title "expensify-cli ${version}" --body-file ../body.md
